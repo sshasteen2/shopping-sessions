@@ -1,0 +1,12 @@
+dev/
+dev-answer/
+out/
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+target/
+*.parquet
+*.pyc
+.DS_Store
+Thumbs.db
