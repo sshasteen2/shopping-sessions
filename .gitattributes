@@ -8,4 +8,4 @@ Dockerfile text eol=lf
 *.lock text eol=lf
 
 # Fixture CSVs are byte-exact (E20 embeds CR as payload, not a line ending).
-fixtures/** -text
+fixtures/** binary
