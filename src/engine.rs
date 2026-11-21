@@ -23,6 +23,18 @@ const LATE_MS: i64 = 86_400_000;
 const MAX_PRICE: i64 = 10_000_000;
 const EMPTY: u32 = u32::MAX;
 
+#[derive(Clone, Copy)]
+struct SliceRef {
+    file: u32,
+    off: u32,
+    len: u32,
+}
+
+fn slice_at(bufs: &[Vec<u8>], k: SliceRef) -> &[u8] {
+    let b = &bufs[k.file as usize];
+    &b[k.off as usize..k.off as usize + k.len as usize]
+}
+
 struct Event {
     user: u32,
     ts: i64,
@@ -33,7 +45,7 @@ struct Event {
 }
 
 struct Click {
-    click_id: u32,
+    click_id: SliceRef,
     user: u32,
     campaign: u32,
     ts: i64,
@@ -222,23 +234,99 @@ pub fn run() {
     mark(t0, &mut last, "links");
 
     let people = Mutex::new(people);
-    let kept_shards: Vec<Mutex<AHashMap<u32, Event>>> = (0..nshards)
-        .map(|_| Mutex::new(AHashMap::new()))
+
+    struct Slot {
+        key: SliceRef,
+        ev: Event,
+    }
+
+    let event_paths = csv_files(&data.join("events"));
+    let event_bufs = Arc::new(
+        event_paths
+            .par_iter()
+            .map(|p| fs::read(p).unwrap_or_default())
+            .collect::<Vec<_>>(),
+    );
+    let kept_shards: Vec<Mutex<(AHashMap<u64, Slot>, AHashMap<u64, Vec<Slot>>)>> = (0..nshards)
+        .map(|_| Mutex::new((AHashMap::new(), AHashMap::new())))
         .collect();
-    csv_files(&data.join("events")).into_par_iter().for_each(|path| {
-        let bytes = fs::read(&path).unwrap_or_default();
-        for_each_record(&bytes, 7, |row| {
+    (0..event_bufs.len()).into_par_iter().for_each(|fi| {
+        let bytes = &event_bufs[fi];
+        let base = bytes.as_ptr() as usize;
+        for_each_record(bytes, 7, |row| {
             if row[0].is_empty() {
                 return;
             }
             let Some(ingest) = parse_ts(row[3]) else {
                 return;
             };
-            let eid = strs.get(row[0]);
-            let shard = (eid >> 24) as usize;
-            let mut map = kept_shards[shard].lock().unwrap();
-            if let Some(old) = map.get(&eid) {
-                if old.ingest <= ingest {
+            let h = strs.hash(row[0]);
+            let shard = (h as usize) % nshards;
+            let off = (row[0].as_ptr() as usize).wrapping_sub(base) as u32;
+            let key = SliceRef {
+                file: fi as u32,
+                off,
+                len: row[0].len() as u32,
+            };
+            let mut guard = kept_shards[shard].lock().unwrap();
+            let (map, extra) = &mut *guard;
+            if let Some(slot) = map.get_mut(&h) {
+                let same = slice_at(&event_bufs, slot.key) == row[0];
+                if same {
+                    if slot.ev.ingest <= ingest {
+                        return;
+                    }
+                } else {
+                    let extras = extra.entry(h).or_default();
+                    if let Some(s) = extras
+                        .iter_mut()
+                        .find(|s| slice_at(&event_bufs, s.key) == row[0])
+                    {
+                        if s.ev.ingest <= ingest {
+                            return;
+                        }
+                        let user = if row[1].is_empty() {
+                            EMPTY
+                        } else {
+                            people.lock().unwrap().intern(row[1])
+                        };
+                        let product = if row[5].is_empty() {
+                            EMPTY
+                        } else {
+                            strs.get(row[5])
+                        };
+                        s.key = key;
+                        s.ev = Event {
+                            user,
+                            ts: parse_ts(row[2]).unwrap_or(i64::MIN),
+                            ingest,
+                            kind: parse_kind(row[4]).unwrap_or(255),
+                            product,
+                            price: parse_price(row[6]).unwrap_or(0),
+                        };
+                        return;
+                    }
+                    let user = if row[1].is_empty() {
+                        EMPTY
+                    } else {
+                        people.lock().unwrap().intern(row[1])
+                    };
+                    let product = if row[5].is_empty() {
+                        EMPTY
+                    } else {
+                        strs.get(row[5])
+                    };
+                    extras.push(Slot {
+                        key,
+                        ev: Event {
+                            user,
+                            ts: parse_ts(row[2]).unwrap_or(i64::MIN),
+                            ingest,
+                            kind: parse_kind(row[4]).unwrap_or(255),
+                            product,
+                            price: parse_price(row[6]).unwrap_or(0),
+                        },
+                    });
                     return;
                 }
             }
@@ -252,57 +340,109 @@ pub fn run() {
             } else {
                 strs.get(row[5])
             };
-            map.insert(
-                eid,
-                Event {
-                    user,
-                    ts: parse_ts(row[2]).unwrap_or(i64::MIN),
-                    ingest,
-                    kind: parse_kind(row[4]).unwrap_or(255),
-                    product,
-                    price: parse_price(row[6]).unwrap_or(0),
-                },
-            );
+            let ev = Event {
+                user,
+                ts: parse_ts(row[2]).unwrap_or(i64::MIN),
+                ingest,
+                kind: parse_kind(row[4]).unwrap_or(255),
+                product,
+                price: parse_price(row[6]).unwrap_or(0),
+            };
+            if let Some(slot) = map.get_mut(&h) {
+                slot.key = key;
+                slot.ev = ev;
+            } else {
+                map.insert(h, Slot { key, ev });
+            }
         });
     });
     mark(t0, &mut last, "parse_events");
 
     let mut events: Vec<Event> = kept_shards
         .into_iter()
-        .flat_map(|m| m.into_inner().unwrap().into_values())
+        .flat_map(|m| {
+            let (map, extra) = m.into_inner().unwrap();
+            map.into_values()
+                .map(|s| s.ev)
+                .chain(extra.into_values().flatten().map(|s| s.ev))
+        })
         .filter(|e| event_valid(e, win_start, win_end))
         .collect();
+    drop(event_bufs);
     mark(t0, &mut last, "validate_events");
 
-    let click_shards: Vec<Mutex<AHashMap<u32, Click>>> = (0..nshards)
-        .map(|_| Mutex::new(AHashMap::new()))
+    let click_paths = csv_files(&data.join("clicks"));
+    let click_bufs = Arc::new(
+        click_paths
+            .par_iter()
+            .map(|p| fs::read(p).unwrap_or_default())
+            .collect::<Vec<_>>(),
+    );
+    let click_shards: Vec<Mutex<(AHashMap<u64, Click>, AHashMap<u64, Vec<Click>>)>> = (0..nshards)
+        .map(|_| Mutex::new((AHashMap::new(), AHashMap::new())))
         .collect();
-    csv_files(&data.join("clicks")).into_par_iter().for_each(|path| {
-        let bytes = fs::read(&path).unwrap_or_default();
-        for_each_record(&bytes, 4, |row| {
+    (0..click_bufs.len()).into_par_iter().for_each(|fi| {
+        let bytes = &click_bufs[fi];
+        let base = bytes.as_ptr() as usize;
+        for_each_record(bytes, 4, |row| {
             if row[0].is_empty() {
                 return;
             }
-            let cid = strs.get(row[0]);
-            let shard = (cid >> 24) as usize;
-            let mut map = click_shards[shard].lock().unwrap();
-            map.entry(cid).or_insert_with(|| Click {
-                click_id: cid,
-                user: if row[1].is_empty() {
-                    EMPTY
-                } else {
-                    people.lock().unwrap().intern(row[1])
+            let h = strs.hash(row[0]);
+            let shard = (h as usize) % nshards;
+            let key = SliceRef {
+                file: fi as u32,
+                off: (row[0].as_ptr() as usize).wrapping_sub(base) as u32,
+                len: row[0].len() as u32,
+            };
+            let mut guard = click_shards[shard].lock().unwrap();
+            let (map, extra) = &mut *guard;
+            if let Some(old) = map.get(&h) {
+                if slice_at(&click_bufs, old.click_id) == row[0] {
+                    return;
+                }
+                let extras = extra.entry(h).or_default();
+                if extras
+                    .iter()
+                    .any(|c| slice_at(&click_bufs, c.click_id) == row[0])
+                {
+                    return;
+                }
+                extras.push(Click {
+                    click_id: key,
+                    user: if row[1].is_empty() {
+                        EMPTY
+                    } else {
+                        people.lock().unwrap().intern(row[1])
+                    },
+                    campaign: strs.get(row[2]),
+                    ts: parse_ts(row[3]).unwrap_or(i64::MIN),
+                });
+                return;
+            }
+            map.insert(
+                h,
+                Click {
+                    click_id: key,
+                    user: if row[1].is_empty() {
+                        EMPTY
+                    } else {
+                        people.lock().unwrap().intern(row[1])
+                    },
+                    campaign: strs.get(row[2]),
+                    ts: parse_ts(row[3]).unwrap_or(i64::MIN),
                 },
-                campaign: strs.get(row[2]),
-                ts: parse_ts(row[3]).unwrap_or(i64::MIN),
-            });
+            );
         });
     });
     mark(t0, &mut last, "parse_clicks");
 
     let mut clicks: Vec<Click> = click_shards
         .into_iter()
-        .flat_map(|m| m.into_inner().unwrap().into_values())
+        .flat_map(|m| {
+            let (map, extra) = m.into_inner().unwrap();
+            map.into_values().chain(extra.into_values().flatten())
+        })
         .filter(|c| {
             c.user != EMPTY
                 && c.ts != i64::MIN
@@ -387,7 +527,7 @@ pub fn run() {
     struct C2 {
         person: u32,
         ts: i64,
-        click_id: u32,
+        click_id: SliceRef,
         campaign: u32,
     }
     let mut c2: Vec<C2> = clicks
@@ -404,7 +544,9 @@ pub fn run() {
         a.person
             .cmp(&b.person)
             .then(a.ts.cmp(&b.ts))
-            .then_with(|| strs.get_bytes(a.click_id).cmp(strs.get_bytes(b.click_id)))
+            .then_with(|| {
+                slice_at(&click_bufs, a.click_id).cmp(slice_at(&click_bufs, b.click_id))
+            })
     });
     let mut clicks_by: AHashMap<u32, Vec<C2>> = AHashMap::new();
     for c in c2 {
@@ -427,13 +569,15 @@ pub fn run() {
         let cred = window
             .iter()
             .filter(|c| c.ts == last_ts)
-            .min_by_key(|c| strs.get_bytes(c.click_id))
+            .min_by_key(|c| slice_at(&click_bufs, c.click_id))
             .unwrap();
         s.credit = Some(cred.campaign);
         for c in window {
             s.assists.insert(c.campaign);
         }
     }
+    drop(clicks_by);
+    drop(click_bufs);
     mark(t0, &mut last, "credit");
 
     #[derive(Default)]

@@ -53,6 +53,10 @@ impl ShardedIntern {
         ((si as u32) << LOCAL_BITS) | local
     }
 
+    pub fn hash(&self, s: &[u8]) -> u64 {
+        self.hasher.hash_one(s)
+    }
+
     pub fn freeze(self) -> FrozenIntern {
         FrozenIntern {
             shards: self
