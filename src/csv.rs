@@ -109,6 +109,30 @@ pub fn parse_into<'a>(line: &'a [u8], expected: usize, out: &mut [&'a [u8]]) -> 
     f == expected
 }
 
+fn split_unquoted<'a>(line: &'a [u8], expected: usize, out: &mut [&'a [u8]]) -> bool {
+    if expected == 0 || expected > out.len() {
+        return false;
+    }
+    let mut f = 0;
+    let mut start = 0;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b',' {
+            if f >= expected {
+                return false;
+            }
+            out[f] = &line[start..i];
+            f += 1;
+            start = i + 1;
+        }
+    }
+    if f >= expected {
+        return false;
+    }
+    out[f] = &line[start..];
+    f += 1;
+    f == expected
+}
+
 pub fn for_each_record(data: &[u8], expected: usize, mut f: impl FnMut(&[&[u8]])) {
     if data.is_empty() {
         return;
@@ -134,7 +158,12 @@ pub fn for_each_record(data: &[u8], expected: usize, mut f: impl FnMut(&[&[u8]])
             continue;
         }
         let mut fields: [&[u8]; 8] = [&[]; 8];
-        if parse_into(line, expected, &mut fields) {
+        let ok = if memchr::memchr(b'"', line).is_none() {
+            split_unquoted(line, expected, &mut fields)
+        } else {
+            parse_into(line, expected, &mut fields)
+        };
+        if ok {
             f(&fields[..expected]);
         }
         if rel.is_none() {
