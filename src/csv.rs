@@ -52,25 +52,103 @@ pub fn parse_record(line: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
     }
 }
 
-pub fn records(data: &[u8], expected: usize) -> Vec<Vec<Vec<u8>>> {
+pub fn parse_into<'a>(line: &'a [u8], expected: usize, out: &mut [&'a [u8]]) -> bool {
+    if line.is_empty() || expected == 0 || expected > out.len() {
+        return false;
+    }
+    let n = line.len();
+    let mut i = 0;
+    let mut f = 0;
+    loop {
+        if f >= expected {
+            return i >= n && f == expected;
+        }
+        if i < n && line[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < n && line[i] != b'"' {
+                i += 1;
+            }
+            if i >= n {
+                return false;
+            }
+            out[f] = &line[start..i];
+            f += 1;
+            i += 1;
+            if i == n {
+                break;
+            }
+            if line[i] != b',' {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && line[i] != b',' {
+            if line[i] == b'"' {
+                return false;
+            }
+            i += 1;
+        }
+        out[f] = &line[start..i];
+        f += 1;
+        if i == n {
+            break;
+        }
+        i += 1;
+        if i == n {
+            if f >= expected {
+                return false;
+            }
+            out[f] = &line[n..n];
+            f += 1;
+            break;
+        }
+    }
+    f == expected
+}
+
+pub fn for_each_record(data: &[u8], expected: usize, mut f: impl FnMut(&[&[u8]])) {
     if data.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut lines: Vec<&[u8]> = data.split(|b| *b == b'\n').collect();
-    if let Some(last) = lines.last() {
-        if last.is_empty() {
-            lines.pop();
+    let mut start = 0;
+    let mut header = true;
+    while start <= data.len() {
+        let rest = &data[start..];
+        if rest.is_empty() {
+            break;
         }
+        let rel = memchr::memchr(b'\n', rest);
+        let (line, next) = match rel {
+            Some(i) => (&rest[..i], start + i + 1),
+            None => (rest, data.len() + 1),
+        };
+        if header {
+            header = false;
+            start = next;
+            if rel.is_none() {
+                break;
+            }
+            continue;
+        }
+        let mut fields: [&[u8]; 8] = [&[]; 8];
+        if parse_into(line, expected, &mut fields) {
+            f(&fields[..expected]);
+        }
+        if rel.is_none() {
+            break;
+        }
+        start = next;
     }
-    if lines.is_empty() {
-        return Vec::new();
-    }
+}
+
+pub fn records(data: &[u8], expected: usize) -> Vec<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    for line in lines.into_iter().skip(1) {
-        if let Some(fields) = parse_record(line, expected) {
-            out.push(fields.into_iter().map(|f| f.to_vec()).collect());
-        }
-    }
+    for_each_record(data, expected, |fields| {
+        out.push(fields.iter().map(|f| f.to_vec()).collect());
+    });
     out
 }
 

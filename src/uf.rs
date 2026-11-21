@@ -3,7 +3,7 @@ use ahash::AHashMap;
 #[derive(Default)]
 pub struct People {
     intern: AHashMap<Vec<u8>, u32>,
-    bytes: Vec<Vec<u8>>,
+    pub bytes: Vec<Vec<u8>>,
     parent: Vec<u32>,
     rank: Vec<u8>,
     min_id: Vec<u32>,
@@ -15,8 +15,9 @@ impl People {
             return i;
         }
         let i = self.bytes.len() as u32;
-        self.intern.insert(id.to_vec(), i);
-        self.bytes.push(id.to_vec());
+        let owned = id.to_vec();
+        self.intern.insert(owned.clone(), i);
+        self.bytes.push(owned);
         self.parent.push(i);
         self.rank.push(0);
         self.min_id.push(i);
