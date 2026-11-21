@@ -1,4 +1,5 @@
 mod csv;
+mod bulk;
 mod engine;
 mod intern;
 mod pq;

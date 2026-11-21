@@ -261,7 +261,8 @@ pub fn run() {
     }
     mark(t0, &mut last, "lookups");
 
-    let people = People::new(nshards);
+    // Many small shards keep each table cache-friendly and balance the bulk fill.
+    let people = People::new(256);
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     for path in csv_files(&data.join("links")) {
         let bytes = fs::read(path).unwrap_or_default();
@@ -391,23 +392,11 @@ pub fn run() {
     });
     mark(t0, &mut last, "dedup_clicks");
 
-    let ev_user: Vec<u32> = events
-        .par_iter()
-        .map(|e| people.intern(slice_at(&event_bufs, e.user)))
-        .collect();
-    let ev_prod: Vec<u32> = events
-        .par_iter()
-        .map(|e| strs.get(slice_at(&event_bufs, e.product)))
-        .collect();
+    let ev_user = people.intern_many(events.len(), |i| slice_at(&event_bufs, events[i].user));
+    let ev_prod = strs.get_many(events.len(), |i| slice_at(&event_bufs, events[i].product));
     drop(event_bufs);
-    let cl_user: Vec<u32> = clicks
-        .par_iter()
-        .map(|c| people.intern(slice_at(&click_bufs, c.user)))
-        .collect();
-    let cl_camp: Vec<u32> = clicks
-        .par_iter()
-        .map(|c| strs.get(slice_at(&click_bufs, c.campaign)))
-        .collect();
+    let cl_user = people.intern_many(clicks.len(), |i| slice_at(&click_bufs, clicks[i].user));
+    let cl_camp = strs.get_many(clicks.len(), |i| slice_at(&click_bufs, clicks[i].campaign));
     mark(t0, &mut last, "intern");
 
     let mut people = people.freeze();

@@ -1,30 +1,38 @@
 use std::sync::Mutex;
 
-use ahash::{AHashMap, RandomState};
+use ahash::RandomState;
+use hashbrown::HashTable;
+
+use rayon::prelude::*;
+
+use crate::bulk::{shard_of, ShardTable};
 
 const LOCAL_BITS: u32 = 24;
 const LOCAL_MASK: u32 = (1 << LOCAL_BITS) - 1;
 
-#[derive(Default)]
 pub struct Intern {
-    map: AHashMap<Vec<u8>, u32>,
+    /// This shard's index, stored in the high bits of every id it hands out.
+    shard: u32,
+    /// (hash, global id)
+    table: HashTable<(u64, u32)>,
     pub bytes: Vec<Vec<u8>>,
 }
 
-impl Intern {
-    pub fn get(&mut self, s: &[u8]) -> u32 {
-        if let Some(&i) = self.map.get(s) {
-            return i;
+impl ShardTable for Intern {
+    fn get_or_insert(&mut self, hash: u64, s: &[u8]) -> u32 {
+        let bytes = &self.bytes;
+        if let Some(&(_, id)) = self
+            .table
+            .find(hash, |&(h, id)| h == hash && bytes[(id & LOCAL_MASK) as usize] == s)
+        {
+            return id;
         }
-        let i = self.bytes.len() as u32;
-        let owned = s.to_vec();
-        self.map.insert(owned.clone(), i);
-        self.bytes.push(owned);
-        i
-    }
-
-    pub fn get_str(&self, i: u32) -> String {
-        String::from_utf8_lossy(&self.bytes[i as usize]).into_owned()
+        let local = self.bytes.len() as u32;
+        assert!(local <= LOCAL_MASK, "intern shard overflow");
+        let id = (self.shard << LOCAL_BITS) | local;
+        self.bytes.push(s.to_vec());
+        self.table.insert_unique(hash, (hash, id), |&(h, _)| h);
+        id
     }
 }
 
@@ -37,20 +45,52 @@ impl ShardedIntern {
     pub fn new(n: usize) -> Self {
         let n = n.max(1);
         Self {
-            shards: (0..n).map(|_| Mutex::new(Intern::default())).collect(),
+            shards: (0..n)
+                .map(|s| {
+                    Mutex::new(Intern {
+                        shard: s as u32,
+                        table: HashTable::new(),
+                        bytes: Vec::new(),
+                    })
+                })
+                .collect(),
             hasher: RandomState::with_seeds(0x1111_2222, 0x3333_4444, 0x5555_6666, 0x7777_8888),
         }
     }
 
-    fn shard_idx(&self, s: &[u8]) -> usize {
-        (self.hasher.hash_one(s) as usize) % self.shards.len()
+    pub fn get(&self, s: &[u8]) -> u32 {
+        let h = self.hasher.hash_one(s);
+        let si = shard_of(h, self.shards.len());
+        self.shards[si].lock().unwrap().get_or_insert(h, s)
     }
 
-    pub fn get(&self, s: &[u8]) -> u32 {
-        let si = self.shard_idx(s);
-        let local = self.shards[si].lock().unwrap().get(s);
-        debug_assert!(local <= LOCAL_MASK);
-        ((si as u32) << LOCAL_BITS) | local
+    /// Interns `key(i)` for every `i in 0..n`, for keys with few distinct
+    /// values (products, campaigns): each chunk keeps a small local cache and
+    /// only takes a shard lock the first time it sees a key.
+    pub fn get_many<'a, K>(&self, n: usize, key: K) -> Vec<u32>
+    where
+        K: Fn(usize) -> &'a [u8] + Sync,
+    {
+        let mut out = vec![0u32; n];
+        let chunk = n.div_ceil(rayon::current_num_threads() * 4).max(1);
+        out.par_chunks_mut(chunk).enumerate().for_each(|(c, dst)| {
+            let lo = c * chunk;
+            let mut cache: HashTable<(u64, &[u8], u32)> = HashTable::new();
+            for (j, slot) in dst.iter_mut().enumerate() {
+                let s = key(lo + j);
+                let h = self.hasher.hash_one(s);
+                *slot = match cache.find(h, |&(ch, cs, _)| ch == h && cs == s) {
+                    Some(&(_, _, id)) => id,
+                    None => {
+                        let si = shard_of(h, self.shards.len());
+                        let id = self.shards[si].lock().unwrap().get_or_insert(h, s);
+                        cache.insert_unique(h, (h, s, id), |&(ch, _, _)| ch);
+                        id
+                    }
+                };
+            }
+        });
+        out
     }
 
     pub fn hash(&self, s: &[u8]) -> u64 {

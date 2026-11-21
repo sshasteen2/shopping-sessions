@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 ahash = "0.8"
+hashbrown = { version = "0.16", default-features = false }
 memchr = "2"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
