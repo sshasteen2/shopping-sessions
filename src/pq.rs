@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
@@ -34,6 +34,10 @@ message schema {
 fn props() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
+        // IDs are nearly all distinct, so dictionaries only cost time; and
+        // nothing reads the statistics.
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
         .build()
 }
 

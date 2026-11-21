@@ -24,7 +24,7 @@ use crate::csv::for_each_record;
 use crate::ids::{Ids, NONE};
 use crate::pq;
 use crate::rows;
-use crate::ts::{parse_ts, parse_ts_str, DAY};
+use crate::ts::{parse_ts_cached, parse_ts_str, DateCache, DAY};
 
 const SESSION_GAP: i64 = 1_800_000;
 const ATTRIB_WINDOW: i64 = 604_800_000;
@@ -281,20 +281,33 @@ impl NameTable {
     }
 }
 
+/// A surviving event, 16 bytes. `ts` is ms from `click_lo` (the start of the
+/// click window, 7 days before the event window); `pc` holds the price in its
+/// low 24 bits (0 unless a purchase) and the category in the top 8.
 #[derive(Clone, Copy)]
 struct Ev2 {
     person: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    kind: u8,
+    ts: u32,
+    pc: u32,
 }
 
+impl Ev2 {
+    #[inline]
+    fn price(&self) -> i64 {
+        (self.pc & 0x00FF_FFFF) as i64
+    }
+    #[inline]
+    fn cat(&self) -> usize {
+        (self.pc >> 24) as usize
+    }
+}
+
+/// A valid click, 24 bytes; `ts` is ms from `click_lo`.
 #[derive(Clone, Copy)]
 struct Ck {
     person: u64,
-    ts: i64,
     cid: u64,
+    ts: u32,
     camp: u32,
 }
 
@@ -370,8 +383,8 @@ pub fn run(n: usize) {
     let day_hi = (win_end - 1).div_euclid(DAY);
     let nd = (day_hi - day_lo + 1).max(1) as usize;
     eprintln!("fast engine: ncpu={n}");
-    if win_end - win_start > u32::MAX as i64 {
-        // Event times are stored as u32 offsets into the window.
+    if win_end - click_lo > u32::MAX as i64 {
+        // Times are stored as u32 offsets from the click window's start.
         return crate::engine::run();
     }
 
@@ -399,6 +412,10 @@ pub fn run(n: usize) {
         (cat_names.len() - 1) as u16
     });
     let ncat = cat_names.len();
+    if ncat > 256 {
+        // Categories are stored in 8 bits.
+        return crate::engine::run();
+    }
     let mut cat_rank = vec![0u32; ncat];
     {
         let mut order: Vec<usize> = (0..ncat).collect();
@@ -511,11 +528,12 @@ pub fn run(n: usize) {
         .map(|c| {
             let cap = c.data.len() / 70 / P + 8;
             let mut b: Vec<Vec<Ev>> = (0..P).map(|_| Vec::with_capacity(cap)).collect();
+            let mut dc = DateCache::default();
             rows::for_each_row::<7>(c.data, c.header, |f| {
                 if f[0].is_empty() {
                     return;
                 }
-                let Some(ingest) = parse_ts(f[3]) else {
+                let Some(ingest) = parse_ts_cached(f[3], &mut dc) else {
                     return;
                 };
                 let user = ids.key(f[1]);
@@ -529,7 +547,7 @@ pub fn run(n: usize) {
                 let mut ok = user != NONE && kind != 3 && !f[5].is_empty();
                 let mut ts = 0u32;
                 if ok {
-                    match parse_ts(f[2]) {
+                    match parse_ts_cached(f[2], &mut dc) {
                         Some(t) if t >= win_start && t < win_end && ingest - t <= LATE_MS => {
                             ts = (t - win_start) as u32
                         }
@@ -594,10 +612,8 @@ pub fn run(n: usize) {
             for e in table.iter().filter(|e| e.pk >> 31 != 0) {
                 outb[part(e.person)].push(Ev2 {
                     person: e.person,
-                    ts: win_start + e.ts as i64,
-                    price: e.pk & 0x00FF_FFFF,
-                    cat: (e.ing_cat & 0xFFFF) as u16,
-                    kind: ((e.pk >> 24) & 3) as u8,
+                    ts: e.ts + (win_start - click_lo) as u32,
+                    pc: (e.pk & 0x00FF_FFFF) | (((e.ing_cat & 0xFF) as u32) << 24),
                 });
             }
             outb
@@ -615,6 +631,7 @@ pub fn run(n: usize) {
         .par_iter()
         .map(|c| {
             let mut v: Vec<Ck> = Vec::with_capacity(c.data.len() / 45 + 8);
+            let mut dc = DateCache::default();
             rows::for_each_row::<4>(c.data, c.header, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -623,7 +640,7 @@ pub fn run(n: usize) {
                 let Some(&camp) = campaigns.get(&ids.key(f[2])) else {
                     return;
                 };
-                let Some(ts) = parse_ts(f[3]) else {
+                let Some(ts) = parse_ts_cached(f[3], &mut dc) else {
                     return;
                 };
                 if ts < click_lo || ts >= win_end {
@@ -631,8 +648,8 @@ pub fn run(n: usize) {
                 }
                 v.push(Ck {
                     person: user,
-                    ts,
                     cid: ids.key(f[0]),
+                    ts: (ts - click_lo) as u32,
                     camp,
                 });
             });
@@ -776,7 +793,7 @@ pub fn run(n: usize) {
                     }
                     nck = wr;
                 }
-                person_pass(persons[r], evs, &cks[..nck], &mut w, day_lo, organic, &cat_rank);
+                person_pass(persons[r], evs, &cks[..nck], &mut w, click_lo, day_lo, organic, &cat_rank);
             }
             w
         })
@@ -881,6 +898,7 @@ fn person_pass(
     ev: &[Ev2],
     clicks: &[Ck],
     w: &mut Work,
+    base: i64,
     day_lo: i64,
     organic: u32,
     cat_rank: &[u32],
@@ -896,20 +914,20 @@ fn person_pass(
         let mut e = i;
         while e < j {
             // One session: [e, s_end)
-            let start = ev[e].ts;
+            let start = ev[e].ts as i64;
             let mut s_end = e + 1;
             let mut prev = start;
-            while s_end < j && ev[s_end].ts - prev <= SESSION_GAP {
-                prev = ev[s_end].ts;
+            while s_end < j && ev[s_end].ts as i64 - prev <= SESSION_GAP {
+                prev = ev[s_end].ts as i64;
                 s_end += 1;
             }
-            let day = start.div_euclid(DAY);
+            let day = (base + start).div_euclid(DAY);
             let d = (day - day_lo) as usize;
 
             // Credit and assists from clicks in [start - 7d, start].
             let mut credit = organic;
             if !clicks.is_empty() {
-                while hi < clicks.len() && clicks[hi].ts <= start {
+                while hi < clicks.len() && (clicks[hi].ts as i64) <= start {
                     let c = clicks[hi].camp as usize;
                     w.counts[c] += 1;
                     if !w.in_active[c] {
@@ -919,7 +937,7 @@ fn person_pass(
                     hi += 1;
                 }
                 let lo_ts = start - ATTRIB_WINDOW;
-                while lo < hi && clicks[lo].ts < lo_ts {
+                while lo < hi && (clicks[lo].ts as i64) < lo_ts {
                     w.counts[clicks[lo].camp as usize] -= 1;
                     lo += 1;
                 }
@@ -948,8 +966,8 @@ fn person_pass(
             // Session totals.
             let mut s_rev = 0i64;
             for x in &ev[e..s_end] {
-                if x.kind == 2 {
-                    s_rev += x.price as i64;
+                if x.pc & 0x00FF_FFFF != 0 {
+                    s_rev += x.price();
                 }
             }
             let s_events = (s_end - e) as i64;
@@ -973,12 +991,12 @@ fn person_pass(
             }
             if s_rev > 0 {
                 for x in &ev[e..s_end] {
-                    if x.kind == 2 {
-                        let c = x.cat as usize;
+                    if x.pc & 0x00FF_FFFF != 0 {
+                        let c = x.cat();
                         if w.cat_rev[c] == 0 {
                             w.cat_touched.push(c as u16);
                         }
-                        w.cat_rev[c] += x.price as i64;
+                        w.cat_rev[c] += x.price();
                     }
                 }
             }
