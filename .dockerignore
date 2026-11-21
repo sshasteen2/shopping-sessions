@@ -1,5 +1,13 @@
+target/
 fixtures/
 dev/
+dev-answer/
 out/
-*.md
 .git
+*.md
+pipeline/
+scripts/
+generator/
+requirements.txt
+Makefile
+run.sh
