@@ -1,19 +1,16 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
-use ahash::{AHashMap, AHashSet};
-use arrow::array::{Date32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use ahash::AHashMap;
+use memmap2::Mmap;
+use parquet::data_type::ByteArray;
 use rayon::prelude::*;
 
 use crate::csv::for_each_record;
 use crate::intern::ShardedIntern;
+use crate::pq;
 use crate::ts::{parse_ts, parse_ts_str, DAY};
 use crate::uf::People;
 
@@ -30,12 +27,54 @@ struct SliceRef {
     len: u32,
 }
 
-fn slice_at(bufs: &[Vec<u8>], k: SliceRef) -> &[u8] {
-    let b = &bufs[k.file as usize];
+struct FileBuf {
+    map: Option<Mmap>,
+    owned: Vec<u8>,
+}
+
+impl FileBuf {
+    fn load(p: &Path) -> Self {
+        if let Ok(f) = File::open(p) {
+            if f.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+                if let Ok(m) = unsafe { Mmap::map(&f) } {
+                    return Self {
+                        map: Some(m),
+                        owned: Vec::new(),
+                    };
+                }
+            }
+        }
+        Self {
+            map: None,
+            owned: fs::read(p).unwrap_or_default(),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match &self.map {
+            Some(m) => m.as_ref(),
+            None => &self.owned,
+        }
+    }
+}
+
+fn slice_at(bufs: &[FileBuf], k: SliceRef) -> &[u8] {
+    let b = bufs[k.file as usize].as_bytes();
     &b[k.off as usize..k.off as usize + k.len as usize]
 }
 
-struct Event {
+fn field_ref(fi: u32, bytes: &[u8], field: &[u8]) -> SliceRef {
+    SliceRef {
+        file: fi,
+        off: (field.as_ptr() as usize).wrapping_sub(bytes.as_ptr() as usize) as u32,
+        len: field.len() as u32,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EventRec {
+    hash: u64,
+    eid: SliceRef,
     user: u32,
     ts: i64,
     ingest: i64,
@@ -44,8 +83,10 @@ struct Event {
     price: i64,
 }
 
-struct Click {
-    click_id: SliceRef,
+#[derive(Clone, Copy)]
+struct ClickRec {
+    hash: u64,
+    cid: SliceRef,
     user: u32,
     campaign: u32,
     ts: i64,
@@ -57,9 +98,9 @@ struct Session {
     day: i32,
     events: i64,
     revenue: i64,
-    cat_rev: AHashMap<u32, i64>,
+    cat_rev: Vec<(u32, i64)>,
     credit: Option<u32>,
-    assists: AHashSet<u32>,
+    assists: Vec<u32>,
 }
 
 fn ncpu() -> usize {
@@ -124,7 +165,7 @@ fn parse_price(s: &[u8]) -> Option<i64> {
     }
 }
 
-fn event_valid(e: &Event, win_lo: i64, win_hi: i64) -> bool {
+fn event_valid(e: &EventRec, win_lo: i64, win_hi: i64) -> bool {
     if e.user == EMPTY || e.product == EMPTY {
         return false;
     }
@@ -143,18 +184,12 @@ fn event_valid(e: &Event, win_lo: i64, win_hi: i64) -> bool {
     true
 }
 
-fn write_parquet(path: &Path, batch: RecordBatch) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).ok();
+fn add_cat(v: &mut Vec<(u32, i64)>, cat: u32, rev: i64) {
+    if let Some(e) = v.iter_mut().find(|e| e.0 == cat) {
+        e.1 += rev;
+    } else {
+        v.push((cat, rev));
     }
-    let file = File::create(path).expect("create parquet");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close parquet");
 }
 
 fn mark(t0: Instant, last: &mut Instant, label: &str) {
@@ -200,9 +235,7 @@ pub fn run() {
             if row[0].is_empty() {
                 return;
             }
-            let p = strs.get(row[0]);
-            let c = strs.get(row[1]);
-            products.insert(p, c);
+            products.insert(strs.get(row[0]), strs.get(row[1]));
         });
     }
     let mut campaigns: AHashMap<u32, u32> = AHashMap::new();
@@ -212,248 +245,159 @@ pub fn run() {
             if row[0].is_empty() {
                 return;
             }
-            let id = strs.get(row[0]);
-            let ch = strs.get(row[1]);
-            campaigns.insert(id, ch);
+            campaigns.insert(strs.get(row[0]), strs.get(row[1]));
         });
     }
     mark(t0, &mut last, "lookups");
 
-    let mut people = People::default();
+    let people = People::new(nshards);
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
     for path in csv_files(&data.join("links")) {
         let bytes = fs::read(path).unwrap_or_default();
         for_each_record(&bytes, 2, |row| {
             if row[0].is_empty() || row[1].is_empty() {
                 return;
             }
-            let a = people.intern(row[0]);
-            let b = people.intern(row[1]);
-            people.union(a, b);
+            pairs.push((people.intern(row[0]), people.intern(row[1])));
         });
     }
     mark(t0, &mut last, "links");
-
-    let people = Mutex::new(people);
-
-    struct Slot {
-        key: SliceRef,
-        ev: Event,
-    }
 
     let event_paths = csv_files(&data.join("events"));
     let event_bufs = Arc::new(
         event_paths
             .par_iter()
-            .map(|p| fs::read(p).unwrap_or_default())
+            .map(|p| FileBuf::load(p))
             .collect::<Vec<_>>(),
     );
-    let kept_shards: Vec<Mutex<(AHashMap<u64, Slot>, AHashMap<u64, Vec<Slot>>)>> = (0..nshards)
-        .map(|_| Mutex::new((AHashMap::new(), AHashMap::new())))
-        .collect();
-    (0..event_bufs.len()).into_par_iter().for_each(|fi| {
-        let bytes = &event_bufs[fi];
-        let base = bytes.as_ptr() as usize;
-        for_each_record(bytes, 7, |row| {
-            if row[0].is_empty() {
-                return;
-            }
-            let Some(ingest) = parse_ts(row[3]) else {
-                return;
-            };
-            let h = strs.hash(row[0]);
-            let shard = (h as usize) % nshards;
-            let off = (row[0].as_ptr() as usize).wrapping_sub(base) as u32;
-            let key = SliceRef {
-                file: fi as u32,
-                off,
-                len: row[0].len() as u32,
-            };
-            let mut guard = kept_shards[shard].lock().unwrap();
-            let (map, extra) = &mut *guard;
-            if let Some(slot) = map.get_mut(&h) {
-                let same = slice_at(&event_bufs, slot.key) == row[0];
-                if same {
-                    if slot.ev.ingest <= ingest {
-                        return;
-                    }
-                } else {
-                    let extras = extra.entry(h).or_default();
-                    if let Some(s) = extras
-                        .iter_mut()
-                        .find(|s| slice_at(&event_bufs, s.key) == row[0])
-                    {
-                        if s.ev.ingest <= ingest {
-                            return;
-                        }
-                        let user = if row[1].is_empty() {
-                            EMPTY
-                        } else {
-                            people.lock().unwrap().intern(row[1])
-                        };
-                        let product = if row[5].is_empty() {
-                            EMPTY
-                        } else {
-                            strs.get(row[5])
-                        };
-                        s.key = key;
-                        s.ev = Event {
-                            user,
-                            ts: parse_ts(row[2]).unwrap_or(i64::MIN),
-                            ingest,
-                            kind: parse_kind(row[4]).unwrap_or(255),
-                            product,
-                            price: parse_price(row[6]).unwrap_or(0),
-                        };
-                        return;
-                    }
-                    let user = if row[1].is_empty() {
+    let mut events: Vec<EventRec> = (0..event_bufs.len())
+        .into_par_iter()
+        .flat_map(|fi| {
+            let bytes = event_bufs[fi].as_bytes();
+            let mut local = Vec::new();
+            for_each_record(bytes, 7, |row| {
+                if row[0].is_empty() {
+                    return;
+                }
+                let Some(ingest) = parse_ts(row[3]) else {
+                    return;
+                };
+                local.push(EventRec {
+                    hash: strs.hash(row[0]),
+                    eid: field_ref(fi as u32, bytes, row[0]),
+                    user: if row[1].is_empty() {
                         EMPTY
                     } else {
-                        people.lock().unwrap().intern(row[1])
-                    };
-                    let product = if row[5].is_empty() {
+                        people.intern(row[1])
+                    },
+                    ts: parse_ts(row[2]).unwrap_or(i64::MIN),
+                    ingest,
+                    kind: parse_kind(row[4]).unwrap_or(255),
+                    product: if row[5].is_empty() {
                         EMPTY
                     } else {
                         strs.get(row[5])
-                    };
-                    extras.push(Slot {
-                        key,
-                        ev: Event {
-                            user,
-                            ts: parse_ts(row[2]).unwrap_or(i64::MIN),
-                            ingest,
-                            kind: parse_kind(row[4]).unwrap_or(255),
-                            product,
-                            price: parse_price(row[6]).unwrap_or(0),
-                        },
-                    });
-                    return;
-                }
-            }
-            let user = if row[1].is_empty() {
-                EMPTY
-            } else {
-                people.lock().unwrap().intern(row[1])
-            };
-            let product = if row[5].is_empty() {
-                EMPTY
-            } else {
-                strs.get(row[5])
-            };
-            let ev = Event {
-                user,
-                ts: parse_ts(row[2]).unwrap_or(i64::MIN),
-                ingest,
-                kind: parse_kind(row[4]).unwrap_or(255),
-                product,
-                price: parse_price(row[6]).unwrap_or(0),
-            };
-            if let Some(slot) = map.get_mut(&h) {
-                slot.key = key;
-                slot.ev = ev;
-            } else {
-                map.insert(h, Slot { key, ev });
-            }
-        });
-    });
+                    },
+                    price: parse_price(row[6]).unwrap_or(0),
+                });
+            });
+            local
+        })
+        .collect();
     mark(t0, &mut last, "parse_events");
 
-    let mut events: Vec<Event> = kept_shards
-        .into_iter()
-        .flat_map(|m| {
-            let (map, extra) = m.into_inner().unwrap();
-            map.into_values()
-                .map(|s| s.ev)
-                .chain(extra.into_values().flatten().map(|s| s.ev))
-        })
-        .filter(|e| event_valid(e, win_start, win_end))
-        .collect();
+    events.par_sort_unstable_by(|a, b| {
+        a.hash
+            .cmp(&b.hash)
+            .then_with(|| slice_at(&event_bufs, a.eid).cmp(slice_at(&event_bufs, b.eid)))
+    });
+    {
+        let mut w = 0usize;
+        for r in 0..events.len() {
+            let same = w > 0
+                && events[r].hash == events[w - 1].hash
+                && slice_at(&event_bufs, events[r].eid) == slice_at(&event_bufs, events[w - 1].eid);
+            if !same {
+                if w != r {
+                    events[w] = events[r];
+                }
+                w += 1;
+            } else if events[r].ingest < events[w - 1].ingest {
+                events[w - 1] = events[r];
+            }
+        }
+        events.truncate(w);
+    }
+    events.retain(|e| event_valid(e, win_start, win_end));
     drop(event_bufs);
-    mark(t0, &mut last, "validate_events");
+    mark(t0, &mut last, "dedup_events");
 
     let click_paths = csv_files(&data.join("clicks"));
     let click_bufs = Arc::new(
         click_paths
             .par_iter()
-            .map(|p| fs::read(p).unwrap_or_default())
+            .map(|p| FileBuf::load(p))
             .collect::<Vec<_>>(),
     );
-    let click_shards: Vec<Mutex<(AHashMap<u64, Click>, AHashMap<u64, Vec<Click>>)>> = (0..nshards)
-        .map(|_| Mutex::new((AHashMap::new(), AHashMap::new())))
-        .collect();
-    (0..click_bufs.len()).into_par_iter().for_each(|fi| {
-        let bytes = &click_bufs[fi];
-        let base = bytes.as_ptr() as usize;
-        for_each_record(bytes, 4, |row| {
-            if row[0].is_empty() {
-                return;
-            }
-            let h = strs.hash(row[0]);
-            let shard = (h as usize) % nshards;
-            let key = SliceRef {
-                file: fi as u32,
-                off: (row[0].as_ptr() as usize).wrapping_sub(base) as u32,
-                len: row[0].len() as u32,
-            };
-            let mut guard = click_shards[shard].lock().unwrap();
-            let (map, extra) = &mut *guard;
-            if let Some(old) = map.get(&h) {
-                if slice_at(&click_bufs, old.click_id) == row[0] {
+    let mut clicks: Vec<ClickRec> = (0..click_bufs.len())
+        .into_par_iter()
+        .flat_map(|fi| {
+            let bytes = click_bufs[fi].as_bytes();
+            let mut local = Vec::new();
+            for_each_record(bytes, 4, |row| {
+                if row[0].is_empty() {
                     return;
                 }
-                let extras = extra.entry(h).or_default();
-                if extras
-                    .iter()
-                    .any(|c| slice_at(&click_bufs, c.click_id) == row[0])
-                {
-                    return;
-                }
-                extras.push(Click {
-                    click_id: key,
+                local.push(ClickRec {
+                    hash: strs.hash(row[0]),
+                    cid: field_ref(fi as u32, bytes, row[0]),
                     user: if row[1].is_empty() {
                         EMPTY
                     } else {
-                        people.lock().unwrap().intern(row[1])
+                        people.intern(row[1])
                     },
                     campaign: strs.get(row[2]),
                     ts: parse_ts(row[3]).unwrap_or(i64::MIN),
                 });
-                return;
-            }
-            map.insert(
-                h,
-                Click {
-                    click_id: key,
-                    user: if row[1].is_empty() {
-                        EMPTY
-                    } else {
-                        people.lock().unwrap().intern(row[1])
-                    },
-                    campaign: strs.get(row[2]),
-                    ts: parse_ts(row[3]).unwrap_or(i64::MIN),
-                },
-            );
-        });
-    });
-    mark(t0, &mut last, "parse_clicks");
-
-    let mut clicks: Vec<Click> = click_shards
-        .into_iter()
-        .flat_map(|m| {
-            let (map, extra) = m.into_inner().unwrap();
-            map.into_values().chain(extra.into_values().flatten())
-        })
-        .filter(|c| {
-            c.user != EMPTY
-                && c.ts != i64::MIN
-                && c.ts >= click_lo
-                && c.ts < win_end
-                && campaigns.contains_key(&c.campaign)
+            });
+            local
         })
         .collect();
-    mark(t0, &mut last, "validate_clicks");
+    mark(t0, &mut last, "parse_clicks");
 
-    let mut people = people.into_inner().unwrap();
+    clicks.par_sort_unstable_by(|a, b| {
+        a.hash
+            .cmp(&b.hash)
+            .then_with(|| slice_at(&click_bufs, a.cid).cmp(slice_at(&click_bufs, b.cid)))
+    });
+    {
+        let mut w = 0usize;
+        for r in 0..clicks.len() {
+            let same = w > 0
+                && clicks[r].hash == clicks[w - 1].hash
+                && slice_at(&click_bufs, clicks[r].cid) == slice_at(&click_bufs, clicks[w - 1].cid);
+            if !same {
+                if w != r {
+                    clicks[w] = clicks[r];
+                }
+                w += 1;
+            }
+        }
+        clicks.truncate(w);
+    }
+    clicks.retain(|c| {
+        c.user != EMPTY
+            && c.ts != i64::MIN
+            && c.ts >= click_lo
+            && c.ts < win_end
+            && campaigns.contains_key(&c.campaign)
+    });
+    mark(t0, &mut last, "dedup_clicks");
+
+    let mut people = people.freeze();
+    for (a, b) in pairs {
+        people.union(a, b);
+    }
     let strs = Arc::try_unwrap(strs).unwrap_or_else(|_| panic!("strs unique"));
     let strs = strs.freeze();
 
@@ -475,15 +419,10 @@ pub fn run() {
         })
         .collect();
     events.clear();
-    e2.sort_unstable_by_key(|e| (e.person, e.ts));
+    e2.par_sort_unstable_by_key(|e| (e.person, e.ts));
     mark(t0, &mut last, "sort_events");
 
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-    struct SessKey {
-        person: u32,
-        start: i64,
-    }
-    let mut sessions: AHashMap<SessKey, Session> = AHashMap::new();
+    let mut sessions: Vec<Session> = Vec::new();
     {
         let mut i = 0;
         while i < e2.len() {
@@ -494,30 +433,39 @@ pub fn run() {
             }
             let mut start = e2[i].ts;
             let mut prev = e2[i].ts;
+            let mut s = Session {
+                person,
+                start,
+                day: start.div_euclid(DAY) as i32,
+                events: 0,
+                revenue: 0,
+                cat_rev: Vec::new(),
+                credit: None,
+                assists: Vec::new(),
+            };
             for k in i..j {
                 if e2[k].ts - prev > SESSION_GAP {
+                    sessions.push(s);
                     start = e2[k].ts;
-                }
-                prev = e2[k].ts;
-                let day = start.div_euclid(DAY) as i32;
-                let s = sessions.entry(SessKey { person, start }).or_insert_with(|| {
-                    Session {
+                    s = Session {
                         person,
                         start,
-                        day,
+                        day: start.div_euclid(DAY) as i32,
                         events: 0,
                         revenue: 0,
-                        cat_rev: AHashMap::new(),
+                        cat_rev: Vec::new(),
                         credit: None,
-                        assists: AHashSet::new(),
-                    }
-                });
+                        assists: Vec::new(),
+                    };
+                }
+                prev = e2[k].ts;
                 s.events += 1;
                 if e2[k].kind == 2 {
                     s.revenue += e2[k].price;
-                    *s.cat_rev.entry(e2[k].category).or_insert(0) += e2[k].price;
+                    add_cat(&mut s.cat_rev, e2[k].category, e2[k].price);
                 }
             }
+            sessions.push(s);
             i = j;
         }
     }
@@ -527,7 +475,7 @@ pub fn run() {
     struct C2 {
         person: u32,
         ts: i64,
-        click_id: SliceRef,
+        cid: SliceRef,
         campaign: u32,
     }
     let mut c2: Vec<C2> = clicks
@@ -535,48 +483,65 @@ pub fn run() {
         .map(|c| C2 {
             person: people.root(c.user),
             ts: c.ts,
-            click_id: c.click_id,
+            cid: c.cid,
             campaign: c.campaign,
         })
         .collect();
     clicks.clear();
-    c2.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.ts.cmp(&b.ts))
-            .then_with(|| {
-                slice_at(&click_bufs, a.click_id).cmp(slice_at(&click_bufs, b.click_id))
-            })
+    c2.par_sort_unstable_by(|a, b| {
+        a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| {
+            slice_at(&click_bufs, a.cid).cmp(slice_at(&click_bufs, b.cid))
+        })
     });
-    let mut clicks_by: AHashMap<u32, Vec<C2>> = AHashMap::new();
-    for c in c2 {
-        clicks_by.entry(c.person).or_default().push(c);
-    }
     mark(t0, &mut last, "sort_clicks");
 
-    for s in sessions.values_mut() {
-        let Some(list) = clicks_by.get(&s.person) else {
-            continue;
-        };
-        let lo = s.start - ATTRIB_WINDOW;
-        let left = list.partition_point(|c| c.ts < lo);
-        let right = list.partition_point(|c| c.ts <= s.start);
-        if left >= right {
-            continue;
-        }
-        let window = &list[left..right];
-        let last_ts = window.last().unwrap().ts;
-        let cred = window
-            .iter()
-            .filter(|c| c.ts == last_ts)
-            .min_by_key(|c| slice_at(&click_bufs, c.click_id))
-            .unwrap();
-        s.credit = Some(cred.campaign);
-        for c in window {
-            s.assists.insert(c.campaign);
+    {
+        let mut k = 0usize;
+        let mut i = 0usize;
+        while i < sessions.len() {
+            let person = sessions[i].person;
+            let mut j = i + 1;
+            while j < sessions.len() && sessions[j].person == person {
+                j += 1;
+            }
+            while k < c2.len() && c2[k].person < person {
+                k += 1;
+            }
+            let mut kend = k;
+            while kend < c2.len() && c2[kend].person == person {
+                kend += 1;
+            }
+            let list = &c2[k..kend];
+            for s in &mut sessions[i..j] {
+                if list.is_empty() {
+                    continue;
+                }
+                let lo = s.start - ATTRIB_WINDOW;
+                let left = list.partition_point(|c| c.ts < lo);
+                let right = list.partition_point(|c| c.ts <= s.start);
+                if left >= right {
+                    continue;
+                }
+                let window = &list[left..right];
+                let last_ts = window.last().unwrap().ts;
+                let cred = window
+                    .iter()
+                    .filter(|c| c.ts == last_ts)
+                    .min_by_key(|c| slice_at(&click_bufs, c.cid))
+                    .unwrap();
+                s.credit = Some(cred.campaign);
+                s.assists.clear();
+                for c in window {
+                    if !s.assists.contains(&c.campaign) {
+                        s.assists.push(c.campaign);
+                    }
+                }
+            }
+            i = j;
+            k = kend;
         }
     }
-    drop(clicks_by);
+    drop(c2);
     drop(click_bufs);
     mark(t0, &mut last, "credit");
 
@@ -585,30 +550,30 @@ pub fn run() {
         sessions: i64,
         events: i64,
         revenue: i64,
-        cat_rev: AHashMap<u32, i64>,
+        cat_rev: Vec<(u32, i64)>,
     }
     let mut user_days: AHashMap<(u32, i32), UserDay> = AHashMap::new();
-    for s in sessions.values() {
+    for s in &sessions {
         let ud = user_days.entry((s.person, s.day)).or_default();
         ud.sessions += 1;
         ud.events += s.events;
         ud.revenue += s.revenue;
-        for (&cat, &rev) in &s.cat_rev {
-            *ud.cat_rev.entry(cat).or_insert(0) += rev;
+        for &(cat, rev) in &s.cat_rev {
+            add_cat(&mut ud.cat_rev, cat, rev);
         }
     }
 
-    let mut u_user = Vec::new();
-    let mut u_day = Vec::new();
-    let mut u_sess = Vec::new();
-    let mut u_ev = Vec::new();
-    let mut u_rev = Vec::new();
-    let mut u_cat: Vec<Option<String>> = Vec::new();
     let mut ukeys: Vec<(u32, i32)> = user_days.keys().copied().collect();
     ukeys.sort_unstable();
+    let mut u_user = Vec::with_capacity(ukeys.len());
+    let mut u_day = Vec::with_capacity(ukeys.len());
+    let mut u_sess = Vec::with_capacity(ukeys.len());
+    let mut u_ev = Vec::with_capacity(ukeys.len());
+    let mut u_rev = Vec::with_capacity(ukeys.len());
+    let mut u_cat: Vec<Option<ByteArray>> = Vec::with_capacity(ukeys.len());
     for (person, day) in ukeys {
         let ud = &user_days[&(person, day)];
-        u_user.push(people.name_str(person));
+        u_user.push(ByteArray::from(people.name_of(person).to_vec()));
         u_day.push(day);
         u_sess.push(ud.sessions);
         u_ev.push(ud.events);
@@ -617,42 +582,29 @@ pub fn run() {
             u_cat.push(None);
         } else {
             let mut best: Option<(u32, i64)> = None;
-            for (&cat, &rev) in &ud.cat_rev {
+            for &(cat, rev) in &ud.cat_rev {
                 match best {
                     None => best = Some((cat, rev)),
                     Some((bcat, brev)) => {
-                        if rev > brev
-                            || (rev == brev && strs.get_bytes(cat) < strs.get_bytes(bcat))
+                        if rev > brev || (rev == brev && strs.get_bytes(cat) < strs.get_bytes(bcat))
                         {
                             best = Some((cat, rev));
                         }
                     }
                 }
             }
-            u_cat.push(best.map(|(c, _)| strs.get_str(c)));
+            u_cat.push(best.map(|(c, _)| ByteArray::from(strs.get_bytes(c).to_vec())));
         }
     }
-    let user_schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
-    let user_batch = RecordBatch::try_new(
-        user_schema,
-        vec![
-            Arc::new(StringArray::from(u_user)),
-            Arc::new(Date32Array::from(u_day)),
-            Arc::new(Int64Array::from(u_sess)),
-            Arc::new(Int64Array::from(u_ev)),
-            Arc::new(Int64Array::from(u_rev)),
-            Arc::new(StringArray::from(u_cat)),
-        ],
-    )
-    .expect("user batch");
-    write_parquet(&out.join("user_daily").join("part-0.parquet"), user_batch);
+    pq::write_user_daily(
+        &out.join("user_daily").join("part-0.parquet"),
+        u_user,
+        u_day,
+        u_sess,
+        u_ev,
+        u_rev,
+        u_cat,
+    );
     mark(t0, &mut last, "write_user");
 
     #[derive(Default)]
@@ -663,7 +615,7 @@ pub fn run() {
         assisted: i64,
     }
     let mut camp_days: AHashMap<(u32, i32), CampDay> = AHashMap::new();
-    for s in sessions.values() {
+    for s in &sessions {
         let camp = s.credit.unwrap_or(organic);
         let cd = camp_days.entry((camp, s.day)).or_default();
         cd.sessions += 1;
@@ -676,6 +628,8 @@ pub fn run() {
         }
     }
 
+    let mut ckeys: Vec<(u32, i32)> = camp_days.keys().copied().collect();
+    ckeys.sort_unstable();
     let mut c_id = Vec::new();
     let mut c_ch = Vec::new();
     let mut c_day = Vec::new();
@@ -683,8 +637,6 @@ pub fn run() {
     let mut c_purch = Vec::new();
     let mut c_rev = Vec::new();
     let mut c_ast = Vec::new();
-    let mut ckeys: Vec<(u32, i32)> = camp_days.keys().copied().collect();
-    ckeys.sort_unstable();
     for (cid, day) in ckeys {
         let cd = &camp_days[&(cid, day)];
         if cd.sessions == 0 && cd.assisted == 0 {
@@ -696,39 +648,23 @@ pub fn run() {
             campaigns.get(&cid).copied().unwrap_or(cid)
         };
         let assisted = if cid == organic { 0 } else { cd.assisted };
-        c_id.push(strs.get_str(cid));
-        c_ch.push(strs.get_str(channel));
+        c_id.push(ByteArray::from(strs.get_bytes(cid).to_vec()));
+        c_ch.push(ByteArray::from(strs.get_bytes(channel).to_vec()));
         c_day.push(day);
         c_sess.push(cd.sessions);
         c_purch.push(cd.purchasing);
         c_rev.push(cd.revenue);
         c_ast.push(assisted);
     }
-    let camp_schema = Arc::new(Schema::new(vec![
-        Field::new("campaign_id", DataType::Utf8, false),
-        Field::new("channel", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("purchasing_sessions", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("assisted_sessions", DataType::Int64, false),
-    ]));
-    let camp_batch = RecordBatch::try_new(
-        camp_schema,
-        vec![
-            Arc::new(StringArray::from(c_id)),
-            Arc::new(StringArray::from(c_ch)),
-            Arc::new(Date32Array::from(c_day)),
-            Arc::new(Int64Array::from(c_sess)),
-            Arc::new(Int64Array::from(c_purch)),
-            Arc::new(Int64Array::from(c_rev)),
-            Arc::new(Int64Array::from(c_ast)),
-        ],
-    )
-    .expect("camp batch");
-    write_parquet(
+    pq::write_campaign_daily(
         &out.join("campaign_daily").join("part-0.parquet"),
-        camp_batch,
+        c_id,
+        c_ch,
+        c_day,
+        c_sess,
+        c_purch,
+        c_rev,
+        c_ast,
     );
     mark(t0, &mut last, "write_camp");
 }
