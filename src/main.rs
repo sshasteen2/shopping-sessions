@@ -5,6 +5,7 @@ mod fast;
 mod ids;
 mod intern;
 mod pq;
+mod rows;
 mod ts;
 mod uf;
 
