@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
@@ -10,9 +10,10 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 
 use crate::csv::for_each_record;
-use crate::intern::Intern;
+use crate::intern::ShardedIntern;
 use crate::ts::{parse_ts, parse_ts_str, DAY};
 use crate::uf::People;
 
@@ -158,6 +159,10 @@ pub fn run() {
     let t0 = Instant::now();
     let mut last = t0;
     let n = ncpu();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .ok();
     let data = data_dir();
     let out = out_dir();
 
@@ -171,7 +176,8 @@ pub fn run() {
         manifest["window_start"], manifest["window_end"], n
     );
 
-    let mut strs = Intern::default();
+    let nshards = n.max(8);
+    let strs = Arc::new(ShardedIntern::new(nshards));
     let unknown = strs.get(b"unknown");
     let organic = strs.get(b"organic");
 
@@ -215,9 +221,12 @@ pub fn run() {
     }
     mark(t0, &mut last, "links");
 
-    let mut kept: AHashMap<u32, Event> = AHashMap::new();
-    for path in csv_files(&data.join("events")) {
-        let bytes = fs::read(path).unwrap_or_default();
+    let people = Mutex::new(people);
+    let kept_shards: Vec<Mutex<AHashMap<u32, Event>>> = (0..nshards)
+        .map(|_| Mutex::new(AHashMap::new()))
+        .collect();
+    csv_files(&data.join("events")).into_par_iter().for_each(|path| {
+        let bytes = fs::read(&path).unwrap_or_default();
         for_each_record(&bytes, 7, |row| {
             if row[0].is_empty() {
                 return;
@@ -226,7 +235,9 @@ pub fn run() {
                 return;
             };
             let eid = strs.get(row[0]);
-            if let Some(old) = kept.get(&eid) {
+            let shard = (eid >> 24) as usize;
+            let mut map = kept_shards[shard].lock().unwrap();
+            if let Some(old) = map.get(&eid) {
                 if old.ingest <= ingest {
                     return;
                 }
@@ -234,14 +245,14 @@ pub fn run() {
             let user = if row[1].is_empty() {
                 EMPTY
             } else {
-                people.intern(row[1])
+                people.lock().unwrap().intern(row[1])
             };
             let product = if row[5].is_empty() {
                 EMPTY
             } else {
                 strs.get(row[5])
             };
-            kept.insert(
+            map.insert(
                 eid,
                 Event {
                     user,
@@ -253,39 +264,45 @@ pub fn run() {
                 },
             );
         });
-    }
+    });
     mark(t0, &mut last, "parse_events");
 
-    let mut events: Vec<Event> = kept
-        .into_values()
+    let mut events: Vec<Event> = kept_shards
+        .into_iter()
+        .flat_map(|m| m.into_inner().unwrap().into_values())
         .filter(|e| event_valid(e, win_start, win_end))
         .collect();
     mark(t0, &mut last, "validate_events");
 
-    let mut click_kept: AHashMap<u32, Click> = AHashMap::new();
-    for path in csv_files(&data.join("clicks")) {
-        let bytes = fs::read(path).unwrap_or_default();
+    let click_shards: Vec<Mutex<AHashMap<u32, Click>>> = (0..nshards)
+        .map(|_| Mutex::new(AHashMap::new()))
+        .collect();
+    csv_files(&data.join("clicks")).into_par_iter().for_each(|path| {
+        let bytes = fs::read(&path).unwrap_or_default();
         for_each_record(&bytes, 4, |row| {
             if row[0].is_empty() {
                 return;
             }
             let cid = strs.get(row[0]);
-            click_kept.entry(cid).or_insert_with(|| Click {
+            let shard = (cid >> 24) as usize;
+            let mut map = click_shards[shard].lock().unwrap();
+            map.entry(cid).or_insert_with(|| Click {
                 click_id: cid,
                 user: if row[1].is_empty() {
                     EMPTY
                 } else {
-                    people.intern(row[1])
+                    people.lock().unwrap().intern(row[1])
                 },
                 campaign: strs.get(row[2]),
                 ts: parse_ts(row[3]).unwrap_or(i64::MIN),
             });
         });
-    }
+    });
     mark(t0, &mut last, "parse_clicks");
 
-    let mut clicks: Vec<Click> = click_kept
-        .into_values()
+    let mut clicks: Vec<Click> = click_shards
+        .into_iter()
+        .flat_map(|m| m.into_inner().unwrap().into_values())
         .filter(|c| {
             c.user != EMPTY
                 && c.ts != i64::MIN
@@ -295,6 +312,10 @@ pub fn run() {
         })
         .collect();
     mark(t0, &mut last, "validate_clicks");
+
+    let mut people = people.into_inner().unwrap();
+    let strs = Arc::try_unwrap(strs).unwrap_or_else(|_| panic!("strs unique"));
+    let strs = strs.freeze();
 
     struct E2 {
         person: u32,
@@ -383,7 +404,7 @@ pub fn run() {
         a.person
             .cmp(&b.person)
             .then(a.ts.cmp(&b.ts))
-            .then_with(|| strs.bytes[a.click_id as usize].cmp(&strs.bytes[b.click_id as usize]))
+            .then_with(|| strs.get_bytes(a.click_id).cmp(strs.get_bytes(b.click_id)))
     });
     let mut clicks_by: AHashMap<u32, Vec<C2>> = AHashMap::new();
     for c in c2 {
@@ -406,7 +427,7 @@ pub fn run() {
         let cred = window
             .iter()
             .filter(|c| c.ts == last_ts)
-            .min_by_key(|c| &strs.bytes[c.click_id as usize])
+            .min_by_key(|c| strs.get_bytes(c.click_id))
             .unwrap();
         s.credit = Some(cred.campaign);
         for c in window {
@@ -457,7 +478,7 @@ pub fn run() {
                     None => best = Some((cat, rev)),
                     Some((bcat, brev)) => {
                         if rev > brev
-                            || (rev == brev && strs.bytes[cat as usize] < strs.bytes[bcat as usize])
+                            || (rev == brev && strs.get_bytes(cat) < strs.get_bytes(bcat))
                         {
                             best = Some((cat, rev));
                         }
