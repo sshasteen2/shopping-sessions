@@ -18,7 +18,6 @@ const SESSION_GAP: i64 = 1_800_000;
 const ATTRIB_WINDOW: i64 = 604_800_000;
 const LATE_MS: i64 = 86_400_000;
 const MAX_PRICE: i64 = 10_000_000;
-const EMPTY: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct SliceRef {
@@ -71,15 +70,27 @@ fn field_ref(fi: u32, bytes: &[u8], field: &[u8]) -> SliceRef {
     }
 }
 
+fn opt_ref(fi: u32, bytes: &[u8], field: &[u8]) -> SliceRef {
+    if field.is_empty() {
+        SliceRef {
+            file: u32::MAX,
+            off: 0,
+            len: 0,
+        }
+    } else {
+        field_ref(fi, bytes, field)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EventRec {
     hash: u64,
     eid: SliceRef,
-    user: u32,
+    user: SliceRef,
     ts: i64,
     ingest: i64,
     kind: u8,
-    product: u32,
+    product: SliceRef,
     price: i64,
 }
 
@@ -87,8 +98,8 @@ struct EventRec {
 struct ClickRec {
     hash: u64,
     cid: SliceRef,
-    user: u32,
-    campaign: u32,
+    user: SliceRef,
+    campaign: SliceRef,
     ts: i64,
 }
 
@@ -166,7 +177,7 @@ fn parse_price(s: &[u8]) -> Option<i64> {
 }
 
 fn event_valid(e: &EventRec, win_lo: i64, win_hi: i64) -> bool {
-    if e.user == EMPTY || e.product == EMPTY {
+    if e.user.file == u32::MAX || e.product.file == u32::MAX {
         return false;
     }
     if e.ts == i64::MIN || e.ts < win_lo || e.ts >= win_hi {
@@ -285,19 +296,11 @@ pub fn run() {
                 local.push(EventRec {
                     hash: strs.hash(row[0]),
                     eid: field_ref(fi as u32, bytes, row[0]),
-                    user: if row[1].is_empty() {
-                        EMPTY
-                    } else {
-                        people.intern(row[1])
-                    },
+                    user: opt_ref(fi as u32, bytes, row[1]),
                     ts: parse_ts(row[2]).unwrap_or(i64::MIN),
                     ingest,
                     kind: parse_kind(row[4]).unwrap_or(255),
-                    product: if row[5].is_empty() {
-                        EMPTY
-                    } else {
-                        strs.get(row[5])
-                    },
+                    product: opt_ref(fi as u32, bytes, row[5]),
                     price: parse_price(row[6]).unwrap_or(0),
                 });
             });
@@ -329,7 +332,6 @@ pub fn run() {
         events.truncate(w);
     }
     events.retain(|e| event_valid(e, win_start, win_end));
-    drop(event_bufs);
     mark(t0, &mut last, "dedup_events");
 
     let click_paths = csv_files(&data.join("clicks"));
@@ -351,12 +353,8 @@ pub fn run() {
                 local.push(ClickRec {
                     hash: strs.hash(row[0]),
                     cid: field_ref(fi as u32, bytes, row[0]),
-                    user: if row[1].is_empty() {
-                        EMPTY
-                    } else {
-                        people.intern(row[1])
-                    },
-                    campaign: strs.get(row[2]),
+                    user: opt_ref(fi as u32, bytes, row[1]),
+                    campaign: field_ref(fi as u32, bytes, row[2]),
                     ts: parse_ts(row[3]).unwrap_or(i64::MIN),
                 });
             });
@@ -386,13 +384,31 @@ pub fn run() {
         clicks.truncate(w);
     }
     clicks.retain(|c| {
-        c.user != EMPTY
+        c.user.file != u32::MAX
             && c.ts != i64::MIN
             && c.ts >= click_lo
             && c.ts < win_end
-            && campaigns.contains_key(&c.campaign)
     });
     mark(t0, &mut last, "dedup_clicks");
+
+    let ev_user: Vec<u32> = events
+        .par_iter()
+        .map(|e| people.intern(slice_at(&event_bufs, e.user)))
+        .collect();
+    let ev_prod: Vec<u32> = events
+        .par_iter()
+        .map(|e| strs.get(slice_at(&event_bufs, e.product)))
+        .collect();
+    drop(event_bufs);
+    let cl_user: Vec<u32> = clicks
+        .par_iter()
+        .map(|c| people.intern(slice_at(&click_bufs, c.user)))
+        .collect();
+    let cl_camp: Vec<u32> = clicks
+        .par_iter()
+        .map(|c| strs.get(slice_at(&click_bufs, c.campaign)))
+        .collect();
+    mark(t0, &mut last, "intern");
 
     let mut people = people.freeze();
     for (a, b) in pairs {
@@ -410,11 +426,12 @@ pub fn run() {
     }
     let mut e2: Vec<E2> = events
         .iter()
-        .map(|e| E2 {
-            person: people.root(e.user),
+        .enumerate()
+        .map(|(i, e)| E2 {
+            person: people.root(ev_user[i]),
             ts: e.ts,
             kind: e.kind,
-            category: products.get(&e.product).copied().unwrap_or(unknown),
+            category: products.get(&ev_prod[i]).copied().unwrap_or(unknown),
             price: if e.kind == 2 { e.price } else { 0 },
         })
         .collect();
@@ -480,11 +497,17 @@ pub fn run() {
     }
     let mut c2: Vec<C2> = clicks
         .iter()
-        .map(|c| C2 {
-            person: people.root(c.user),
-            ts: c.ts,
-            cid: c.cid,
-            campaign: c.campaign,
+        .enumerate()
+        .filter_map(|(i, c)| {
+            if !campaigns.contains_key(&cl_camp[i]) {
+                return None;
+            }
+            Some(C2 {
+                person: people.root(cl_user[i]),
+                ts: c.ts,
+                cid: c.cid,
+                campaign: cl_camp[i],
+            })
         })
         .collect();
     clicks.clear();
