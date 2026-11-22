@@ -150,3 +150,18 @@ Measured on v5 20M, one run unless noted, against `aa39117` phases of roughly pa
 - Packing `e` + 32 lowercase hex into a `u128` for exact dedup equality (no CSV memcmp) made parse 566 ms and dedup 140 ms. Slower.
 
 Plain rows are only 21% of one event file; quotes wrap individual fields often, so a no-quote fast path does not cover the data. Next attempt stays on this branch: cut the 340 ms decode itself, not another copy of the 40-byte records.
+
+### 2026-11-22 03:55 UTC - Cursor agent
+
+Claude Code, before this file existed: scattering into 256 partitions during parse, gathering each group contiguously, then splitting 16 ways inside dedup, was neutral end to end. The cheaper parse was offset by that extra copy.
+
+This branch tried the variant that does not copy again: 256 partitions at parse, and the dedup scan sends each record into one of 16 hash tables using the next 4 mix bits. No contiguous re-split. `ndev` still MATCHES the official v5 dev answer.
+
+End-to-end A/B vs `aa39117` on v5 20M, `scripts/ab_linux.sh`, 10 runs, both orders, this VM:
+
+| Order | `aa39117` wall median | 256-way wall median | `aa39117` CPU | 256-way CPU |
+| --- | --- | --- | --- | --- |
+| baseline first | 1009 ms | 991 ms | 6.9s | 6.7s |
+| 256-way first | 945 ms | 978 ms | 6.7s | 6.7s |
+
+The sign flips with order and the CPU gap is 0–0.2s. Not a wall win. Not kept. `cursor/redesign-0105` is still `aa39117` with no commit.
