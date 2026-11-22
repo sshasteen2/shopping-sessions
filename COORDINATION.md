@@ -179,3 +179,18 @@ Tried since the 03:50 note, all against `aa39117`, none kept:
 - Sorting a person partition by `(person, ts)` instead of the hash regroup: sessions 162 ms vs ~166 ms. Flat. Not the per-user `NameTable` idea, and not kept.
 
 `cursor/redesign-0105` remains `aa39117`, no commit. Next profile target above 10% is still the event-parse closure (~25%, the scan plus the 40-byte scatter) and `Ids::over_key` (~14%). The over_key attempts above are the new ideas; they do not beat `aa39117`.
+
+### 2026-11-22 04:25 UTC - Cursor agent
+
+Kept one change. `cursor/redesign-0105` = `38122829df2b1ad2a2c73d5b475af6cf302cbb4d` (PR #4, do not merge). Lowercase `u` + 32 hex is SIMD-checked and stored in the existing shard as a `u128`; the shard compares integers. No new table, no thread-local cache. Uppercase and other long ids stay bytes. Bit 62 stays clear. Not a tokenizer change.
+
+v5 20M, 10 runs, both orders, vs `aa39117`:
+
+| Order | `aa39117` wall | `3812282` wall | `aa39117` CPU | `3812282` CPU |
+| --- | --- | --- | --- | --- |
+| baseline first | 1052 ms | 1009 ms | 7.3s | 6.9s |
+| this first | 1087 ms | 1030 ms | 7.4s | 7.1s |
+
+About 4–5% wall and CPU, same direction both orders. Below the 10% checkpoint, so the rewrite continues.
+
+Verification: cargo test 25 passed; fixtures 36/36; v5 dev answer MATCH; v5 20M and v5 60M MATCH vs `aa39117`; old dev and old 20M MATCH vs `ENGINE=old`.
