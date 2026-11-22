@@ -135,3 +135,18 @@ Branches: `cursor/robust-fallback-0105` = `11c6b93e276acfda536c7a14586409492bf78
 | Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs 42e7549 | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
 | `cursor/robust-fallback-0105` | `11c6b93` | batched `e`/`k` hex intern + user cache, no event-hash | Cursor VM median 1060–1120 ms vs 1198–1218 | 7.4–7.6s vs 8.1–8.3s | about -8% to -12% wall | 36/36, v5 dev answer, v5 20M+60M vs `42e7549`, old dev+20M. Loses when stacked on `aa39117`. |
+
+### 2026-11-22 03:50 UTC - Cursor agent
+
+Started `cursor/redesign-0105` at `aa39117` (not pushed; no commit yet). Target is about 0.65s on this VM. Nothing below is a keeper.
+
+Measured on v5 20M, one run unless noted, against `aa39117` phases of roughly parse_events 520 ms and dedup 120 ms:
+
+- Skipping the event partition scatter drops `parse_events` to about 340 ms. That second write is about 180 ms. Output is then wrong, so this is only a floor.
+- Writing each event straight into 4096 bucket vecs (no second scatter) made parse 543 ms and dedup 255 ms. 256 bucket vecs: parse 460 ms, dedup 192 ms. Both slower overall. Dedup wants one contiguous slice per bucket; many small vecs are worse to scan.
+- Scatter prefetch, and write-combining 4 records per destination, left `parse_events` at 512–522 ms.
+- Outlining the row body (`#[inline(never)]`), 6-run A/B: median 989 ms / CPU 6.7s vs `aa39117` 995 ms / 6.9s. A tie.
+- A memchr field splitter matched the reference scanner on the dialect tests, 600 random buffers, and 25,245 real event rows. On 2 MB it took 19.4 ms vs 8.2 ms for the SIMD scanner. Not used.
+- Packing `e` + 32 lowercase hex into a `u128` for exact dedup equality (no CSV memcmp) made parse 566 ms and dedup 140 ms. Slower.
+
+Plain rows are only 21% of one event file; quotes wrap individual fields often, so a no-quote fast path does not cover the data. Next attempt stays on this branch: cut the 340 ms decode itself, not another copy of the 40-byte records.
