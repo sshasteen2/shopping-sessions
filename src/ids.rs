@@ -160,25 +160,49 @@ impl Default for Ids {
     }
 }
 
+/// Packed key for a non-empty id that fits in 10 alphabet characters.
+/// `None` when the id is empty, longer than 10, or has any other byte.
+/// Bit 63 is always clear. Integer order of two packed keys is byte order.
+#[inline]
+pub fn pack_key(s: &[u8]) -> Option<u64> {
+    let n = s.len();
+    if n == 0 || n > MAX_LEN {
+        return None;
+    }
+    let mut k = 0u64;
+    let mut bad = false;
+    for &b in s {
+        let c = CODE[b as usize];
+        bad |= c == 0;
+        k = (k << 6) | c as u64;
+    }
+    if bad {
+        None
+    } else {
+        Some(k << (6 * (MAX_LEN - n)))
+    }
+}
+
+/// Writes a packed key back to its bytes.
+#[inline]
+pub fn append_packed(k: u64, out: &mut Vec<u8>) {
+    for i in (0..MAX_LEN).rev() {
+        let c = (k >> (6 * i)) & 63;
+        if c == 0 {
+            break;
+        }
+        out.push(DECODE[c as usize]);
+    }
+}
+
 impl Ids {
     /// The packed key if `s` is non-empty and fits the packed form.
     #[inline]
     pub fn packed(&self, s: &[u8]) -> Option<u64> {
-        let n = s.len();
-        if n == 0 || n > MAX_LEN {
-            return if n == 0 { Some(NONE) } else { None };
-        }
-        let mut k = 0u64;
-        let mut bad = false;
-        for &b in s {
-            let c = CODE[b as usize];
-            bad |= c == 0;
-            k = (k << 6) | c as u64;
-        }
-        if bad {
-            None
+        if s.is_empty() {
+            Some(NONE)
         } else {
-            Some(k << (6 * (MAX_LEN - n)))
+            pack_key(s)
         }
     }
 

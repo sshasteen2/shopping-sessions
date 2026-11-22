@@ -5,6 +5,7 @@ mod fast;
 mod ids;
 mod intern;
 mod pq;
+mod rogue;
 mod rows;
 mod ts;
 mod uf;
@@ -25,8 +26,10 @@ fn ncpu() -> usize {
 }
 
 fn main() {
-    // ENGINE=old runs the previous engine, for side-by-side checks.
-    if std::env::var("ENGINE").as_deref() == Ok("old") {
+    // ENGINE=old is the original engine. ENGINE=fast is the aa39117 partitioned
+    // engine. Both stay as references. The default engine is the rogue rewrite.
+    let engine = std::env::var("ENGINE").ok();
+    if engine.as_deref() == Some("old") {
         engine::run();
         return;
     }
@@ -35,5 +38,9 @@ fn main() {
         .num_threads(n)
         .build_global()
         .ok();
-    fast::run(n);
+    if engine.as_deref() == Some("fast") {
+        fast::run(n);
+        return;
+    }
+    rogue::run(n);
 }
