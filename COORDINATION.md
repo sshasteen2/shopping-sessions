@@ -194,3 +194,22 @@ v5 20M, 10 runs, both orders, vs `aa39117`:
 About 4–5% wall and CPU, same direction both orders. Below the 10% checkpoint, so the rewrite continues.
 
 Verification: cargo test 25 passed; fixtures 36/36; v5 dev answer MATCH; v5 20M and v5 60M MATCH vs `aa39117`; old dev and old 20M MATCH vs `ENGINE=old`.
+
+### 2026-11-22 04:40 UTC - Cursor agent
+
+Still on `cursor/redesign-0105` = `3812282`. No new commit. Click-id packing and the next cuts at the event-parse loop were measured on v5 20M and did not add a same-direction win. Do not merge PR #4.
+
+Profile of `3812282` (`cpu-clock:u`, one run, wall 1352 ms under perf): event-parse closure 24.5%, `Ids::over_key` 18.1%, dedup fold 10.0%, session closure 9.3%, `parse_ts_cached` 4.8%, click-parse closure 4.1%. Inside `over_key` the hottest instruction is the failed `lock cmpxchg` on the hex-user shard mutex. A separate rdtsc split of the event build (21.6M rows): user id still about 90 real cycles/row after the u128 change, then the event timestamp, then event-id and product. Summed across threads, the build is about 340 ms and the 4096-way scatter about 120 ms, so the decode is the larger of those two.
+
+Tried on top of `3812282`, none kept:
+
+- Lowercase `k` + 32 hex in the same shard, prefix in a side byte so the `u` value stays 16 bytes. `ndev` MATCH. 6 runs both orders vs `3812282`: medians 1121/1059 ms vs 1134/1090 ms, CPU identical at 7.8s and 7.4s. Wall wiggles, CPU does not. Not a win.
+- Lock-free open-addressed `u128` table (64-byte slots, lazy mmap) instead of the shard mutex for `u` + hex. `ndev` MATCH. One run: links 333 ms, parse_events 528 ms, sys 2.57s, wall 1339 ms. Page faults ate the lock savings.
+- 16,384 shards instead of 1,024. One run wall 1215 ms, user 7.10s. Slower.
+- AVX2 comma/quote masks in the CSV scanner, checked against a scalar reference on 200 random buffers and the dialect tests. `ndev` MATCH. 6 runs both orders vs `3812282`: 1188/1168 ms vs 1092/1091 ms, CPU 8.1s vs 7.4–7.5s. Slower both orders.
+- Spinlock instead of `std::Mutex` on the shards. `ndev` MATCH. 10 runs both orders: 1128/1095 ms vs 1094/1115 ms, CPU 7.6/7.2s vs 7.5/7.3s. Sign flips.
+- 8 MB chunks (still inside the eloc offset limit). `ndev` MATCH. 10 runs both orders: 1037/982 ms vs 982/1036 ms, CPU 6.8/6.6s vs 6.7/7.0s. The second binary wins both orders.
+- `MADV_SEQUENTIAL` on the input maps. `ndev` MATCH. 8 runs both orders: 972/944 ms vs 986/987 ms, CPU 6.8/6.6s vs 6.8/6.8s. Wall is slightly lower both orders, CPU only in one. Too small to keep.
+- Same source rebuilt `-C target-cpu=native` (this VM has AVX-512). `ndev` MATCH. 8 runs both orders: 972/990 ms vs the v3 binary 939/925 ms, CPU 6.8/6.7s vs 6.4/6.5s. Slower both orders. Not safe to assume the scorer has AVX-512 anyway.
+
+`3812282` remains the best verified commit, about 4–5% vs `aa39117`. That is under the 10% checkpoint. The costs above 10% (event-parse closure, `over_key`) do not have a further concrete fix that beat `3812282` in both A/B orders.
