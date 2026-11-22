@@ -213,3 +213,28 @@ Tried on top of `3812282`, none kept:
 - Same source rebuilt `-C target-cpu=native` (this VM has AVX-512). `ndev` MATCH. 8 runs both orders: 972/990 ms vs the v3 binary 939/925 ms, CPU 6.8/6.7s vs 6.4/6.5s. Slower both orders. Not safe to assume the scorer has AVX-512 anyway.
 
 `3812282` remains the best verified commit, about 4–5% vs `aa39117`. That is under the 10% checkpoint. The costs above 10% (event-parse closure, `over_key`) do not have a further concrete fix that beat `3812282` in both A/B orders.
+
+### 2026-11-22 04:50 UTC - ROGUE (Cursor agent 2)
+
+Branch `cursor/rogue-redesign` only, created from `aa39117`. Did not touch `cursor/redesign-0105`, `main`, or any open PR. Commit `e4955c19f911b912dc4379e950d6ac0f0edb2801`. Nothing here is a keeper. Do not merge it and do not point the scorer at it.
+
+What it does: short alphabet ids still pack into a u64 (integer order is byte order). Every longer user, event and click id — 33-byte hex, a fully upper-case id, a space — is a tagged hash plus the original bytes. Equal hashes are confirmed by those bytes. Person-name minimums and click-id tie-breaks compare the bytes, including a short id against a long one. There is no shared intern table on that path. The CSV scan is a copy of `rows::for_each_row` inlined into the event and click parsers; a randomized test checks it against the reference tokenizer. `ENGINE=fast` is still `aa39117`'s engine and `ENGINE=old` is the older one. A 16-byte dedup key with the payload in a side array was built and then removed: dedup got slower because every survivor chased that array. The kept records are one struct per event, scanned in order.
+
+Also tried, all slower than the version above, all exact on dev before they were replaced: hashing short ids as well as long ones (person grouping then memcmp'd every row; 20M wall about 1.8s vs 1.1s), and copying each long name into its own allocation.
+
+v5 20M, seed 7, `scripts/ab_linux.sh`, 10 runs, both orders, `RUSTFLAGS="-C target-cpu=x86-64-v3"`, this VM, vs a clean build of `aa39117`:
+
+| Order | `aa39117` wall median | `e4955c1` wall median | `aa39117` CPU | `e4955c1` CPU |
+| --- | --- | --- | --- | --- |
+| baseline first | 1048 ms (min 945) | 1285 ms (min 1217) | 7.1s | 8.1s |
+| this first | 1029 ms (min 977) | 1250 ms (min 1168) | 7.0s | 8.0s |
+
+About +21% to +23% wall and about +1s CPU, same direction both orders. One 60M run (seed 42) was 6.63s vs 3.24s for `ENGINE=fast` in the same binary. The gap is links (byte-resolving 1.2M ids), a fatter event record, and dedup confirming long event ids.
+
+Verification for `e4955c1`: `cargo test --release` 27 passed (includes packed-key order, short/long/upper-case byte order, and the randomized tokenizer check); fixtures 36/36; official v5 dev answer MATCH; v5 20M and v5 60M MATCH vs `aa39117`'s engine.
+
+No gain. `aa39117` stays the best commit on this branch.
+
+| Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs aa39117 | Verification |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cursor/rogue-redesign` | `e4955c1` | hash long ids off the intern table, inlined scanner | Cursor VM median 1250–1285 ms vs 1029–1048 | 8.0–8.1s vs 7.0–7.1s | about +21% to +23% wall | 27 tests, 36/36, v5 dev answer, v5 20M+60M MATCH. Not kept. |
