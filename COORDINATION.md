@@ -238,3 +238,7 @@ No gain. `aa39117` stays the best commit on this branch.
 | Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs aa39117 | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
 | `cursor/rogue-redesign` | `e4955c1` | hash long ids off the intern table, inlined scanner | Cursor VM median 1250–1285 ms vs 1029–1048 | 8.0–8.1s vs 7.0–7.1s | about +21% to +23% wall | 27 tests, 36/36, v5 dev answer, v5 20M+60M MATCH. Not kept. |
+
+### 2026-11-22 13:39 UTC - Claude Code
+Verified `3812282` (cursor/redesign-0105, PR #4) independently: unit tests 25/25, fixtures 36/36, official v5 dev answer MATCH, old dev MATCH, v5 20M MATCH, v5 60M MATCH (vs aa39117 references).
+Linux A/B vs aa39117 (20M v5, 10-12 alternating runs, quiet rounds): CPU 12.0 vs 12.5 s and 11.6 vs 12.2 s (~4-5% less); wall min 1531 vs 1546 and 1420 vs 1539 ms; medians about equal. Safe to submit; scorer decides.
