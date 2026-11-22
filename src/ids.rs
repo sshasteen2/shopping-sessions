@@ -97,6 +97,27 @@ impl Default for Ids {
 }
 
 impl Ids {
+    /// The packed key if `s` is non-empty and fits the packed form.
+    #[inline]
+    pub fn packed(&self, s: &[u8]) -> Option<u64> {
+        let n = s.len();
+        if n == 0 || n > MAX_LEN {
+            return if n == 0 { Some(NONE) } else { None };
+        }
+        let mut k = 0u64;
+        let mut bad = false;
+        for &b in s {
+            let c = CODE[b as usize];
+            bad |= c == 0;
+            k = (k << 6) | c as u64;
+        }
+        if bad {
+            None
+        } else {
+            Some(k << (6 * (MAX_LEN - n)))
+        }
+    }
+
     /// The key for an ID; `NONE` for the empty string.
     #[inline]
     pub fn key(&self, s: &[u8]) -> u64 {

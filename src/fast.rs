@@ -347,9 +347,14 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 // ---------------------------------------------------------------- records
 
-/// A parsed event, 32 bytes. `ing_cat` holds ingest_ts (ms from window start,
+/// A parsed event, 40 bytes. `ing_cat` holds ingest_ts (ms from window start,
 /// clamped to 48 bits) above a 16-bit category; `pk` holds the price in its
 /// low 24 bits, the kind in bits 24-25 and "valid" in bit 31.
+///
+/// `eid` is an exact ID key, or for a long event_id (since scorer v5) a tagged
+/// hash of its bytes (`HASHED_EID`); then `eloc` holds where those bytes are in
+/// the chunk (offset << 9 | length), and dedup compares the bytes whenever two
+/// hashed keys are equal, so a hash collision can never merge two events.
 #[derive(Clone, Copy)]
 struct Ev {
     eid: u64,
@@ -357,7 +362,13 @@ struct Ev {
     ing_cat: u64,
     ts: u32,
     pk: u32,
+    eloc: u32,
 }
+
+/// Tag for hashed event_id keys: top two bits set. Interned keys have bit 62
+/// clear (shard numbers are below 2^30) and packed keys have bit 63 clear.
+const HASHED_EID: u64 = 0b11 << 62;
+const ELOC_LEN_BITS: u32 = 9;
 
 impl Ev {
     #[inline]
@@ -765,6 +776,7 @@ pub fn run(n: usize) {
     // ------------------------------------------------------------ events
     let event_bufs = load_dir(&data.join("events"));
     let ev_chunks = chunks(&event_bufs);
+    let eid_hasher = ahash::RandomState::with_seeds(0x1F83_D9AB, 0x5BE0_CD19, 0x6A09_E667, 0xBB67_AE85);
     let ev_buckets: Vec<Parts<Ev>> = ev_chunks
         .par_iter()
         .map(|c| {
@@ -778,7 +790,19 @@ pub fn run(n: usize) {
                     return;
                 };
                 let user = ids.key(f[1]);
-                let eid = ids.key(f[0]);
+                let (eid, eloc) = match ids.packed(f[0]) {
+                    Some(k) => (k, 0),
+                    None => {
+                        let off = f[0].as_ptr() as usize - c.data.as_ptr() as usize;
+                        let len = f[0].len();
+                        if len < (1 << ELOC_LEN_BITS) && off < (1 << (32 - ELOC_LEN_BITS)) {
+                            let h = eid_hasher.hash_one(f[0]);
+                            (HASHED_EID | (h >> 2), ((off as u32) << ELOC_LEN_BITS) | len as u32)
+                        } else {
+                            (ids.key(f[0]), 0)
+                        }
+                    }
+                };
                 let kind: u32 = match f[4] {
                     b"view" => 0,
                     b"cart" => 1,
@@ -814,13 +838,13 @@ pub fn run(n: usize) {
                     ing_cat: ((ing as u64) << 16) | cat as u64,
                     ts,
                     pk: price | (kind << 24) | ((ok as u32) << 31),
+                    eloc,
                 });
             });
             names.resolve_valid(&mut b);
             partition_n(&b, P * SUB, |e| (mix(e.eid) >> (64 - PBITS - SUB_BITS)) as usize)
         })
         .collect();
-    std::mem::forget(ev_chunks);
     mark(t0, &mut last, "parse_events");
 
     // Dedup per event_id partition, then scatter survivors by person. The table
@@ -833,25 +857,35 @@ pub fn run(n: usize) {
                 .map(|s| ev_buckets.iter().map(|b| b.slice(p * SUB + s).len()).sum::<usize>())
                 .sum();
             let mut kept: Vec<Ev2> = Vec::with_capacity(total);
-            let mut table: HashTable<Ev> = HashTable::with_capacity(total / SUB * 2 + 64);
+            let eid_bytes = |e: &Ev, ci: u32| -> &[u8] {
+                let off = (e.eloc >> ELOC_LEN_BITS) as usize;
+                let len = (e.eloc & ((1 << ELOC_LEN_BITS) - 1)) as usize;
+                &ev_chunks[ci as usize].data[off..off + len]
+            };
+            let same = |a: &Ev, ac: u32, b: &Ev, bc: u32| -> bool {
+                a.eid == b.eid && (a.eid & HASHED_EID != HASHED_EID || eid_bytes(a, ac) == eid_bytes(b, bc))
+            };
+            // (record, chunk index)
+            let mut table: HashTable<(Ev, u32)> = HashTable::with_capacity(total / SUB * 2 + 64);
             for sp in p * SUB..(p + 1) * SUB {
                 table.clear();
-                for b in &ev_buckets {
+                for (ci, b) in ev_buckets.iter().enumerate() {
+                    let ci = ci as u32;
                     for e in b.slice(sp) {
                         let h = mix(e.eid ^ DEDUP_SEED);
-                        match table.find_mut(h, |x| x.eid == e.eid) {
+                        match table.find_mut(h, |x| same(&x.0, x.1, e, ci)) {
                             Some(x) => {
-                                if e.ingest() < x.ingest() {
-                                    *x = *e;
+                                if e.ingest() < x.0.ingest() {
+                                    *x = (*e, ci);
                                 }
                             }
                             None => {
-                                table.insert_unique(h, *e, |x| mix(x.eid ^ DEDUP_SEED));
+                                table.insert_unique(h, (*e, ci), |x| mix(x.0.eid ^ DEDUP_SEED));
                             }
                         }
                     }
                 }
-                kept.extend(table.iter().filter(|e| e.pk >> 31 != 0).map(|e| Ev2 {
+                kept.extend(table.iter().map(|x| &x.0).filter(|e| e.pk >> 31 != 0).map(|e| Ev2 {
                     person: e.person,
                     ts: e.ts + (win_start - click_lo) as u32,
                     pc: (e.pk & 0x00FF_FFFF) | (((e.ing_cat & 0xFF) as u32) << 24),
@@ -861,6 +895,7 @@ pub fn run(n: usize) {
             partition(&kept, |e| part(e.person))
         })
         .collect();
+    drop(ev_chunks);
     rayon::spawn(move || {
         ev_buckets.into_par_iter().for_each(drop);
         drop(event_bufs);
