@@ -165,3 +165,17 @@ End-to-end A/B vs `aa39117` on v5 20M, `scripts/ab_linux.sh`, 10 runs, both orde
 | 256-way first | 945 ms | 978 ms | 6.7s | 6.7s |
 
 The sign flips with order and the CPU gap is 0–0.2s. Not a wall win. Not kept. `cursor/redesign-0105` is still `aa39117` with no commit.
+
+### 2026-11-22 04:15 UTC - Cursor agent
+
+Field breakdown of the event decode on v5 20M (rdtsc around each step, 21.6M rows). Cheap steps are inflated by the timer (~30 cycles), so the ranking after that overhead is: user id, then the two timestamps, then event id, then product lookup. Kind and price are noise. User id is about 90 real cycles/row because roughly 1 in 8 ids is 33 bytes and those take the shard lock (~600 cycles). Making that lock free is at most ~65 ms of wall. Invalid rows are only a few percent, so skipping work on them cannot move the run by 10%.
+
+Tried since the 03:50 note, all against `aa39117`, none kept:
+
+- SWAR `HH:MM:SS` inside `parse_ts_cached`, checked against `parse_ts` for every hour/minute and the usual bad forms. 10 runs both orders: medians 953/997 ms vs 1039/954 ms, CPU 6.6–6.7s vs 6.6–7.1s. Sign flips. Not a wall win.
+- Post-scan batch intern of long user ids (short ids still pack inline; invalid rows still carry event id, ingest, valid flag). `parse_events` stayed ~496 ms. One full run ~1102 ms. Not a win.
+- Same shard table, but `u` + 32 lowercase hex stored and compared as a `u128`, plus a thread-local cache. `ndev` MATCH. 10 runs both orders: 1008/1041 ms vs 974/952 ms, CPU 6.9/7.0s vs 6.8/6.6s. Slower both orders.
+- Replacing dedup's `mix` with one multiply: dedup 133 ms vs ~120 ms. Not kept.
+- Sorting a person partition by `(person, ts)` instead of the hash regroup: sessions 162 ms vs ~166 ms. Flat. Not the per-user `NameTable` idea, and not kept.
+
+`cursor/redesign-0105` remains `aa39117`, no commit. Next profile target above 10% is still the event-parse closure (~25%, the scan plus the 40-byte scatter) and `Ids::over_key` (~14%). The over_key attempts above are the new ideas; they do not beat `aa39117`.
