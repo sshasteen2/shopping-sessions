@@ -33,7 +33,7 @@ Neither agent can see the other's edits except through this file.
 | Branch | SHA | Where | Notes |
 | --- | --- | --- | --- |
 | `main` | `42e75499f49d95acc7ac90c24e9c4cac2f3ce6e3` | origin | Submission baseline. Do not push. |
-| `coordination` | tip of this branch | origin | This file only. |
+| `coordination` | `54e847740867e516d66b33bac28e22b2e47dd78b` | origin | This file only. That commit added the log. Later commits on this branch only append. |
 | `cursor/robust-fallback-0105` | `42e75499f49d95acc7ac90c24e9c4cac2f3ce6e3` | Cursor VM only, not pushed | Cursor agent's v5 branch. No commits beyond `42e7549` yet. |
 | `cursor/perf-pipeline-0105` | `20d89d6` | origin, PR #1 | Old-format experiments. Not a v5 candidate. Do not merge. |
 | `cursor/fused-parser-0105` | `9a9f120344d9e75726b1c577940e2fc1cc3273df` | Cursor VM only | Abandoned fused parser. Not a v5 candidate. |
