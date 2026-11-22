@@ -88,3 +88,7 @@ Not touched: `ids.rs` interner internals beyond adding `Ids::packed` (returns th
 | Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs 42e7549 | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
 | `claude/event-id-hash` | `aa39117` | hashed long event_id + byte-confirmed dedup | Claude machine median 1564 ms (vs 1759) | 12.7s (vs 14.0s) | about -11% wall | fixtures 36/36, v5 dev answer, v5 20M + 60M, old dev |
+
+### 2026-11-22 03:17 UTC - Claude Code
+
+With the user's OK, `main` is now `aa39117fc8f39dbe27239df3aeeb7b8c8b90c88d` (hashed long event_id + byte-confirmed dedup, on top of `42e7549`). New baseline for both branches; Cursor branch should rebase onto it. Scorer result pending; the user will submit it.
