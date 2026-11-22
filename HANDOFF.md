@@ -21,7 +21,20 @@ Read this before touching anything. It covers what the pipeline does, how to pro
 | `0484ec1` | Counting-sort regrouping, sub-partitioned dedup, dense ID lookup | 1.4103s |
 | `9a9f120` | Filter in front of the person-name table (~6% less CPU) | 1.4273s, submitted |
 
-`9a9f120` is the current baseline. It has been submitted. Practice score 1.4273s versus 1.4103s for `0484ec1` is a tie inside the scorer's noise, so the name-table filter stays.
+`9a9f120` is the submitted baseline. Practice score 1.4273s versus 1.4103s for `0484ec1` is a tie inside the scorer's noise, so the name-table filter stays.
+
+Local A/B on this machine (8 vCPU, 20M events, seed 7), alternating runs, release build with `target-cpu=x86-64-v3`:
+
+| Change | Wall median | CPU mean | Kept |
+|---|---|---|---|
+| LLVM `-C llvm-args=-inline-threshold=1000` | 902 → 872 ms and 876 → 857 ms | 6.1 → 5.9 s and 6.1 → 5.8 s | yes |
+| Radix-sort events by `ts`, then stable group | 982 vs 983 ms | 6.4 vs 6.5 s | no |
+| SWAR `HH:MM:SS` and 8-digit F3 parse | 878 vs 864 ms | 5.9 vs 5.9 s | no |
+| Open-addressing dedup table (replaced hashbrown) | 799 vs 787 ms | 5.5 vs 5.4 s | no |
+| Multiply hash inside hashbrown dedup | 811 vs 824 ms | 5.8 vs 5.7 s | no |
+| Unrolled ID packing (microbench, 9-byte ids) | — | ~4 ns either way | no |
+
+Each row is its own alternating A/B. Absolute times drifted between sessions, so compare only within a row.
 
 The scorer's times vary by up to ±20% between machines, so differences under about 10% cannot be read from single submissions. `9a9f120` at 1.4273s versus `0484ec1` at 1.4103s is that kind of tie.
 

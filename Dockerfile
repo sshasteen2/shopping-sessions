@@ -3,7 +3,7 @@ FROM rust:bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C llvm-args=-inline-threshold=1000"
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
