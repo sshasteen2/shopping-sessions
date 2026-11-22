@@ -207,6 +207,44 @@ fn partition<T: Copy>(v: &[T], key: impl Fn(&T) -> usize) -> Parts<T> {
     partition_n(v, P, key)
 }
 
+/// Ask Linux to back a large buffer with transparent huge pages. First touch
+/// then faults 2 MB pages instead of 4 KB pages. A no-op where huge pages are off.
+fn advise_huge<T>(v: &mut Vec<T>) {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let bytes = v.capacity().saturating_mul(std::mem::size_of::<T>());
+        if bytes < (1 << 20) {
+            return;
+        }
+        let ptr = v.as_mut_ptr() as usize;
+        let page = 4096usize;
+        let start = (ptr + page - 1) & !(page - 1);
+        let end = ptr + bytes;
+        if end <= start {
+            return;
+        }
+        unsafe {
+            let mut ret: isize;
+            core::arch::asm!(
+                "syscall",
+                in("rax") 28isize, // madvise
+                in("rdi") start,
+                in("rsi") end - start,
+                in("rdx") 14isize, // MADV_HUGEPAGE
+                lateout("rax") ret,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+            let _ = ret;
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = v;
+    }
+}
+
 fn partition_n<T: Copy>(v: &[T], nparts: usize, key: impl Fn(&T) -> usize) -> Parts<T> {
     let ks: Vec<u16> = v.iter().map(|x| key(x) as u16).collect();
     let mut counts = vec![0u32; nparts];
@@ -219,11 +257,37 @@ fn partition_n<T: Copy>(v: &[T], nparts: usize, key: impl Fn(&T) -> usize) -> Pa
     }
     let mut pos: Vec<u32> = off[..nparts].to_vec();
     let mut data: Vec<T> = Vec::with_capacity(v.len());
+    advise_huge(&mut data);
+    // Eight records per partition, then one sequential flush. A direct scatter
+    // writes one record to a random cache line; the flush writes 8 in a row.
+    const B: usize = 8;
+    let mut staged: Vec<T> = Vec::with_capacity(nparts * B);
+    // SAFETY: `T: Copy` has no destructor. Slots are overwritten before they are read.
+    unsafe { staged.set_len(nparts * B) };
+    let mut nloc = vec![0u8; nparts];
     {
         let dst = data.spare_capacity_mut();
         for (x, &k) in v.iter().zip(&ks) {
-            dst[pos[k as usize] as usize].write(*x);
-            pos[k as usize] += 1;
+            let k = k as usize;
+            let n = nloc[k] as usize;
+            staged[k * B + n] = *x;
+            if n + 1 == B {
+                let at = pos[k] as usize;
+                for j in 0..B {
+                    dst[at + j].write(staged[k * B + j]);
+                }
+                pos[k] += B as u32;
+                nloc[k] = 0;
+            } else {
+                nloc[k] = (n + 1) as u8;
+            }
+        }
+        for k in 0..nparts {
+            let n = nloc[k] as usize;
+            let at = pos[k] as usize;
+            for j in 0..n {
+                dst[at + j].write(staged[k * B + j]);
+            }
         }
     }
     // SAFETY: every one of the v.len() slots was written exactly once.
@@ -833,6 +897,7 @@ pub fn run(n: usize) {
                 .map(|s| ev_buckets.iter().map(|b| b.slice(p * SUB + s).len()).sum::<usize>())
                 .sum();
             let mut kept: Vec<Ev2> = Vec::with_capacity(total);
+            advise_huge(&mut kept);
             let mut table: HashTable<Ev> = HashTable::with_capacity(total / SUB * 2 + 64);
             for sp in p * SUB..(p + 1) * SUB {
                 table.clear();
@@ -957,6 +1022,7 @@ pub fn run(n: usize) {
             }
             let mut pos: Vec<u32> = off[..np].to_vec();
             let mut ev: Vec<Ev2> = Vec::with_capacity(total);
+            advise_huge(&mut ev);
             {
                 let dst = ev.spare_capacity_mut();
                 let mut n = 0;
