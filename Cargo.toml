@@ -3,6 +3,7 @@ name = "shopping-sessions"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT"
 
 [dependencies]
 ahash = "0.8"
