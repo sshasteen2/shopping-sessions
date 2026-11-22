@@ -374,15 +374,42 @@ impl Ev {
 struct NameTable {
     mask: usize,
     slots: Vec<u64>,
+    /// One bit per hashed key: clear means the key is certainly not stored,
+    /// so most lookups (IDs that are their own person's name, or unlinked)
+    /// never touch the big table.
+    filter: Vec<u64>,
+    fshift: u32,
 }
 
 impl NameTable {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
+        let fbits = (n * 16).next_power_of_two().max(64);
         Self {
             mask: cap - 1,
             slots: vec![0; cap * 2],
+            filter: vec![0; fbits / 64],
+            fshift: 64 - fbits.trailing_zeros(),
         }
+    }
+    #[inline]
+    fn fbit(&self, k: u64) -> usize {
+        (mix(k ^ 0x6A09_E667_F3BC_C908) >> self.fshift) as usize
+    }
+    #[inline]
+    fn maybe(&self, k: u64) -> bool {
+        let b = self.fbit(k);
+        (self.filter[b >> 6] >> (b & 63)) & 1 != 0
+    }
+    #[inline]
+    fn prefetch_filter(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.filter.as_ptr().add(self.fbit(k) >> 6) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = k;
     }
     #[inline]
     fn home(&self, k: u64) -> usize {
@@ -393,7 +420,11 @@ impl NameTable {
         unsafe { &*(self.slots.as_slice() as *const [u64] as *const [std::sync::atomic::AtomicU64]) }
     }
     fn insert(&self, k: u64, v: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let b = self.fbit(k);
+        // SAFETY: AtomicU64 has the same size and alignment as u64.
+        let fw = unsafe { &*(self.filter.as_ptr().add(b >> 6) as *const AtomicU64) };
+        fw.fetch_or(1 << (b & 63), Relaxed);
         let a = self.atomics();
         let mut i = self.home(k);
         loop {
@@ -425,7 +456,10 @@ impl NameTable {
     fn resolve_valid(&self, items: &mut [Ev]) {
         const AHEAD: usize = 16;
         for i in 0..items.len() {
-            if i + AHEAD < items.len() && items[i + AHEAD].pk >> 31 != 0 {
+            if i + 2 * AHEAD < items.len() {
+                self.prefetch_filter(items[i + 2 * AHEAD].person);
+            }
+            if i + AHEAD < items.len() && items[i + AHEAD].pk >> 31 != 0 && self.maybe(items[i + AHEAD].person) {
                 self.prefetch(items[i + AHEAD].person);
             }
             if items[i].pk >> 31 != 0 {
@@ -439,9 +473,15 @@ impl NameTable {
     fn resolve<T>(&self, items: &mut [T], key: impl Fn(&mut T) -> &mut u64) {
         const AHEAD: usize = 16;
         for i in 0..items.len() {
+            if i + 2 * AHEAD < items.len() {
+                let k = *key(&mut items[i + 2 * AHEAD]);
+                self.prefetch_filter(k);
+            }
             if i + AHEAD < items.len() {
                 let k = *key(&mut items[i + AHEAD]);
-                self.prefetch(k);
+                if self.maybe(k) {
+                    self.prefetch(k);
+                }
             }
             let k = key(&mut items[i]);
             *k = self.get(*k);
@@ -450,6 +490,9 @@ impl NameTable {
 
     #[inline]
     fn get(&self, k: u64) -> u64 {
+        if !self.maybe(k) {
+            return k;
+        }
         let mut i = self.home(k);
         loop {
             let (sk, sv) = (self.slots[2 * i], self.slots[2 * i + 1]);
@@ -706,10 +749,14 @@ pub fn run(n: usize) {
                 min_key[r] = keys[i];
             }
         }
-        let t = NameTable::new(keys.len());
-        keys.par_iter()
-            .zip(parent.par_iter())
-            .for_each(|(&k, &r)| t.insert(k, min_key[r as usize]));
+        let remap = keys.iter().zip(&parent).filter(|&(&k, &r)| min_key[r as usize] != k).count();
+        let t = NameTable::new(remap);
+        keys.par_iter().zip(parent.par_iter()).for_each(|(&k, &r)| {
+            let name = min_key[r as usize];
+            if name != k {
+                t.insert(k, name);
+            }
+        });
         t
     };
     std::mem::forget(pairs);
