@@ -69,3 +69,22 @@ Generator check, from the current `generator.zip` sources: `write_id_suffix` emi
 Plan for the Cursor branch only: keep `u64` keys. For lowercase prefix + 32 hex digits, store `(prefix, u128)` in the sharded table and compare the two integers. Uppercase and every other long id stay on the byte arena. `ids.cmp` for two packed keys compares the prefix byte, then the `u128`, which matches lexicographic order; every other pair still goes through the bytes. Repeated user ids (`u` prefix) can use a thread-local cache of that `u128`. Click ids stay on the shared packed table because they are unique and their order is the tie-break. No event-dedup changes in `fast.rs`.
 
 Finding for the event-ID path, measured earlier on this VM and then removed from the working tree so it does not collide: not interning long event ids (copy the bytes, partition by a content hash, memcmp in dedup) was an 8-run median of 1107 ms wall and 7.50s CPU against 1331 ms and 9.17s for `42e7549`. Dedup got slower than the shard baseline on that build because equality chased copied bytes. A 16-byte integer compare, instead of memcmp, is the piece that build did not have. That experiment is not a commit and is not being continued here.
+
+### 2026-11-22 03:08 UTC - Claude Code
+
+Event-ID equality path, done and verified: branch `claude/event-id-hash`, commit `aa39117fc8f39dbe27239df3aeeb7b8c8b90c88d` (one commit on top of `42e7549`; pushed to origin, not to `main`).
+
+What it does: a long event_id (anything that does not fit the packed u64) gets key `0b11 << 62 | (ahash(bytes) >> 2)`, and the event record (`Ev`, now 40 bytes) carries `eloc = offset << 9 | len` into its parse chunk. Dedup groups by key; when two hashed keys are equal it compares the original bytes from the chunk, so a hash collision cannot merge two events. Short ids keep the packed key; ids longer than 511 bytes or past offset 2^23 fall back to the interner. Tag cannot collide with interned keys (bit 62 is clear there, shard < 2^30) or packed keys (bit 63 clear). Chunk buffers now stay alive until dedup ends.
+
+Results on Claude's machine (Linux/WSL2, Ryzen 7 8840HS, 8 threads), v5 seed 7 20M, `scripts/ab_linux.sh`, 10 alternating runs each, two orders:
+- run 1: `42e7549` median 2257 ms / CPU 15.6s; `aa39117` median 1998 ms / CPU 14.4s (machine busy)
+- run 2 (order swapped): `aa39117` median 1564 ms / CPU 12.7s; `42e7549` median 1759 ms / CPU 14.0s
+- about -11% wall, -8 to -9% CPU, both orders.
+
+Verification for `aa39117`: 36/36 fixtures; official v5 `dev-answer` MATCH; old-format dev MATCH vs old engine; v5 20M (seed 7) and v5 60M (seed 42) MATCH vs `42e7549`.
+
+Not touched: `ids.rs` interner internals beyond adding `Ids::packed` (returns the packed key or None, no interning). User and click ids are still interned exactly as in `42e7549`, so the Cursor branch's 128-bit work should rebase cleanly; the only shared file edit is that one new method.
+
+| Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs 42e7549 | Verification |
+| --- | --- | --- | --- | --- | --- | --- |
+| `claude/event-id-hash` | `aa39117` | hashed long event_id + byte-confirmed dedup | Claude machine median 1564 ms (vs 1759) | 12.7s (vs 14.0s) | about -11% wall | fixtures 36/36, v5 dev answer, v5 20M + 60M, old dev |
