@@ -33,6 +33,10 @@ const MAX_PRICE: u64 = 10_000_000;
 
 const PBITS: u32 = 8;
 const P: usize = 1 << PBITS;
+/// Each event_id partition splits into SUB sub-partitions, so a dedup table
+/// (a few thousand entries) stays in L2.
+const SUB_BITS: u32 = 4;
+const SUB: usize = 1 << SUB_BITS;
 const CHUNK: usize = 4 << 20;
 
 #[inline]
@@ -46,6 +50,185 @@ fn mix(x: u64) -> u64 {
 #[inline]
 fn part(x: u64) -> usize {
     (mix(x) >> (64 - PBITS)) as usize
+}
+
+/// Small open-addressing map from an ID key to a value, hashed with one
+/// multiply; key 0 (the empty ID) marks a free slot and is never stored.
+struct KeyMap<V: Copy> {
+    shift: u32,
+    keys: Vec<u64>,
+    vals: Vec<V>,
+}
+
+impl<V: Copy + Default> KeyMap<V> {
+    fn new(n: usize) -> Self {
+        let cap = (n * 4).next_power_of_two().max(16);
+        Self {
+            shift: 64 - cap.trailing_zeros(),
+            keys: vec![0; cap],
+            vals: vec![V::default(); cap],
+        }
+    }
+    #[inline]
+    fn home(&self, k: u64) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+    /// Inserts or overwrites; returns false when the key was already present.
+    fn insert(&mut self, k: u64, v: V) -> bool {
+        debug_assert!(k != 0);
+        let mask = self.keys.len() - 1;
+        let mut i = self.home(k);
+        loop {
+            if self.keys[i] == k {
+                self.vals[i] = v;
+                return false;
+            }
+            if self.keys[i] == 0 {
+                self.keys[i] = k;
+                self.vals[i] = v;
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    #[inline]
+    fn get(&self, k: u64) -> Option<V> {
+        if k == 0 {
+            return None;
+        }
+        let mask = self.keys.len() - 1;
+        let mut i = self.home(k);
+        loop {
+            let sk = self.keys[i];
+            if sk == k {
+                return Some(self.vals[i]);
+            }
+            if sk == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+/// ID -> small value lookup with a cache-sized fast path. IDs of the form
+/// `<prefix><number>` (the prefix of the first ID, a canonical number: no
+/// leading zeros, below DENSE_MAX) index a dense array; every other ID goes
+/// through a `KeyMap`. Exact: the number form is only used when the string
+/// is canonical, so `p0123` never matches `p123`.
+struct IdLookup {
+    prefix: Vec<u8>,
+    dense: Vec<u16>, // 0 = absent, else value + 1
+    rest: KeyMap<u16>,
+}
+
+const DENSE_MAX: u64 = 1 << 22;
+
+impl IdLookup {
+    /// The canonical number after `prefix`, if `s` has that form.
+    #[inline]
+    fn number(prefix: &[u8], s: &[u8]) -> Option<u64> {
+        let n = prefix.len();
+        if s.len() <= n || s.len() > n + 7 || &s[..n] != prefix {
+            return None;
+        }
+        let digits = &s[n..];
+        if digits[0] == b'0' && digits.len() > 1 {
+            return None;
+        }
+        let mut v = 0u64;
+        for &b in digits {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as u64;
+        }
+        Some(v)
+    }
+
+    fn build(items: &[(Vec<u8>, u16)], ids: &Ids) -> Self {
+        let prefix: Vec<u8> = items
+            .first()
+            .map(|(id, _)| id.iter().take_while(|b| !b.is_ascii_digit()).copied().collect())
+            .unwrap_or_default();
+        let mut dense: Vec<u16> = Vec::new();
+        let mut rest = KeyMap::new(items.len());
+        for (id, v) in items {
+            match Self::number(&prefix, id) {
+                Some(num) if num < DENSE_MAX => {
+                    let i = num as usize;
+                    if dense.len() <= i {
+                        dense.resize(i + 1, 0);
+                    }
+                    // Later rows win, as with a map insert.
+                    dense[i] = v + 1;
+                }
+                _ => {
+                    rest.insert(ids.key(id), *v);
+                }
+            }
+        }
+        Self { prefix, dense, rest }
+    }
+
+    #[inline]
+    fn get(&self, s: &[u8], ids: &Ids) -> Option<u16> {
+        if let Some(num) = Self::number(&self.prefix, s) {
+            if num < DENSE_MAX {
+                let i = num as usize;
+                return match self.dense.get(i) {
+                    Some(&v) if v != 0 => Some(v - 1),
+                    _ => None,
+                };
+            }
+        }
+        self.rest.get(ids.key(s))
+    }
+}
+
+/// Records grouped by partition: partition `p` is `data[off[p]..off[p + 1]]`.
+struct Parts<T> {
+    data: Vec<T>,
+    off: Vec<u32>,
+}
+
+impl<T> Parts<T> {
+    #[inline]
+    fn slice(&self, p: usize) -> &[T] {
+        &self.data[self.off[p] as usize..self.off[p + 1] as usize]
+    }
+}
+
+/// Stable counting sort of `v` into `P` partitions. Writing a few hundred
+/// thousand records into one cache-sized array is far cheaper than pushing
+/// each into one of `P` separate growing vectors.
+fn partition<T: Copy>(v: &[T], key: impl Fn(&T) -> usize) -> Parts<T> {
+    partition_n(v, P, key)
+}
+
+fn partition_n<T: Copy>(v: &[T], nparts: usize, key: impl Fn(&T) -> usize) -> Parts<T> {
+    let ks: Vec<u16> = v.iter().map(|x| key(x) as u16).collect();
+    let mut counts = vec![0u32; nparts];
+    for &k in &ks {
+        counts[k as usize] += 1;
+    }
+    let mut off = vec![0u32; nparts + 1];
+    for i in 0..nparts {
+        off[i + 1] = off[i] + counts[i];
+    }
+    let mut pos: Vec<u32> = off[..nparts].to_vec();
+    let mut data: Vec<T> = Vec::with_capacity(v.len());
+    {
+        let dst = data.spare_capacity_mut();
+        for (x, &k) in v.iter().zip(&ks) {
+            dst[pos[k as usize] as usize].write(*x);
+            pos[k as usize] += 1;
+        }
+    }
+    // SAFETY: every one of the v.len() slots was written exactly once.
+    unsafe { data.set_len(v.len()) };
+    Parts { data, off }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -394,6 +577,7 @@ pub fn run(n: usize) {
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut cat_idx: std::collections::HashMap<Vec<u8>, u16> = Default::default();
     let mut products: U64Map<u16> = U64Map::default();
+    let mut product_items: Vec<(Vec<u8>, u16)> = Vec::new();
     {
         let bytes = fs::read(data.join("products.csv")).unwrap_or_default();
         for_each_record(&bytes, 2, |row| {
@@ -405,12 +589,14 @@ pub fn run(n: usize) {
                 (cat_names.len() - 1) as u16
             });
             products.insert(ids.key(row[0]), c);
+            product_items.push((row[0].to_vec(), c));
         });
     }
     let unknown = *cat_idx.entry(b"unknown".to_vec()).or_insert_with(|| {
         cat_names.push(b"unknown".to_vec());
         (cat_names.len() - 1) as u16
     });
+    let products: IdLookup = IdLookup::build(&product_items, &ids);
     let ncat = cat_names.len();
     if ncat > 256 {
         // Categories are stored in 8 bits.
@@ -444,7 +630,16 @@ pub fn run(n: usize) {
             camp_channels.push(row[1].to_vec());
         });
     }
+    let campaigns: IdLookup = {
+        let items: Vec<(Vec<u8>, u16)> =
+            camp_ids.iter().enumerate().map(|(i, id)| (id.clone(), i as u16)).collect();
+        IdLookup::build(&items, &ids)
+    };
     let ncamp = camp_ids.len();
+    if ncamp > u16::MAX as usize {
+        // Campaign indexes are stored in 16 bits.
+        return crate::engine::run();
+    }
     let organic = ncamp as u32;
     mark(t0, &mut last, "lookups");
 
@@ -523,11 +718,10 @@ pub fn run(n: usize) {
     // ------------------------------------------------------------ events
     let event_bufs = load_dir(&data.join("events"));
     let ev_chunks = chunks(&event_bufs);
-    let ev_buckets: Vec<Vec<Vec<Ev>>> = ev_chunks
+    let ev_buckets: Vec<Parts<Ev>> = ev_chunks
         .par_iter()
         .map(|c| {
-            let cap = c.data.len() / 70 / P + 8;
-            let mut b: Vec<Vec<Ev>> = (0..P).map(|_| Vec::with_capacity(cap)).collect();
+            let mut b: Vec<Ev> = Vec::with_capacity(c.data.len() / 70 + 16);
             let mut dc = DateCache::default();
             rows::for_each_row::<7>(c.data, c.header, |f| {
                 if f[0].is_empty() {
@@ -562,12 +756,12 @@ pub fn run(n: usize) {
                     }
                 }
                 let cat = if ok {
-                    products.get(&ids.key(f[5])).copied().unwrap_or(unknown)
+                    products.get(f[5], &ids).unwrap_or(unknown)
                 } else {
                     0
                 };
                 let ing = (ingest - win_start).clamp(-(1i64 << 47), (1i64 << 47) - 1);
-                b[part(eid)].push(Ev {
+                b.push(Ev {
                     eid,
                     person: user,
                     ing_cat: ((ing as u64) << 16) | cat as u64,
@@ -575,10 +769,8 @@ pub fn run(n: usize) {
                     pk: price | (kind << 24) | ((ok as u32) << 31),
                 });
             });
-            for v in &mut b {
-                names.resolve_valid(v);
-            }
-            b
+            names.resolve_valid(&mut b);
+            partition_n(&b, P * SUB, |e| (mix(e.eid) >> (64 - PBITS - SUB_BITS)) as usize)
         })
         .collect();
     std::mem::forget(ev_chunks);
@@ -587,36 +779,39 @@ pub fn run(n: usize) {
     // Dedup per event_id partition, then scatter survivors by person. The table
     // hashes with a different seed than `part`, whose top bits are constant here.
     const DEDUP_SEED: u64 = 0xA5A5_5A5A_DEAD_BEEF;
-    let ev_by_person: Vec<Vec<Vec<Ev2>>> = (0..P)
+    let ev_by_person: Vec<Parts<Ev2>> = (0..P)
         .into_par_iter()
         .map(|p| {
-            let total: usize = ev_buckets.iter().map(|b| b[p].len()).sum();
-            let mut table: HashTable<Ev> = HashTable::with_capacity(total);
-            for b in &ev_buckets {
-                for e in &b[p] {
-                    let h = mix(e.eid ^ DEDUP_SEED);
-                    match table.find_mut(h, |x| x.eid == e.eid) {
-                        Some(x) => {
-                            if e.ingest() < x.ingest() {
-                                *x = *e;
+            let total: usize = (0..SUB)
+                .map(|s| ev_buckets.iter().map(|b| b.slice(p * SUB + s).len()).sum::<usize>())
+                .sum();
+            let mut kept: Vec<Ev2> = Vec::with_capacity(total);
+            let mut table: HashTable<Ev> = HashTable::with_capacity(total / SUB * 2 + 64);
+            for sp in p * SUB..(p + 1) * SUB {
+                table.clear();
+                for b in &ev_buckets {
+                    for e in b.slice(sp) {
+                        let h = mix(e.eid ^ DEDUP_SEED);
+                        match table.find_mut(h, |x| x.eid == e.eid) {
+                            Some(x) => {
+                                if e.ingest() < x.ingest() {
+                                    *x = *e;
+                                }
                             }
-                        }
-                        None => {
-                            table.insert_unique(h, *e, |x| mix(x.eid ^ DEDUP_SEED));
+                            None => {
+                                table.insert_unique(h, *e, |x| mix(x.eid ^ DEDUP_SEED));
+                            }
                         }
                     }
                 }
-            }
-            let cap = total / P + 8;
-            let mut outb: Vec<Vec<Ev2>> = (0..P).map(|_| Vec::with_capacity(cap)).collect();
-            for e in table.iter().filter(|e| e.pk >> 31 != 0) {
-                outb[part(e.person)].push(Ev2 {
+                kept.extend(table.iter().filter(|e| e.pk >> 31 != 0).map(|e| Ev2 {
                     person: e.person,
                     ts: e.ts + (win_start - click_lo) as u32,
                     pc: (e.pk & 0x00FF_FFFF) | (((e.ing_cat & 0xFF) as u32) << 24),
-                });
+                }));
             }
-            outb
+            drop(table);
+            partition(&kept, |e| part(e.person))
         })
         .collect();
     rayon::spawn(move || {
@@ -627,7 +822,7 @@ pub fn run(n: usize) {
 
     // ------------------------------------------------------------ clicks
     let click_bufs = load_dir(&data.join("clicks"));
-    let ck_buckets: Vec<Vec<Vec<Ck>>> = chunks(&click_bufs)
+    let ck_buckets: Vec<Parts<Ck>> = chunks(&click_bufs)
         .par_iter()
         .map(|c| {
             let mut v: Vec<Ck> = Vec::with_capacity(c.data.len() / 45 + 8);
@@ -637,9 +832,10 @@ pub fn run(n: usize) {
                     return;
                 }
                 let user = ids.key(f[1]);
-                let Some(&camp) = campaigns.get(&ids.key(f[2])) else {
+                let Some(camp) = campaigns.get(f[2], &ids) else {
                     return;
                 };
+                let camp = camp as u32;
                 let Some(ts) = parse_ts_cached(f[3], &mut dc) else {
                     return;
                 };
@@ -654,12 +850,7 @@ pub fn run(n: usize) {
                 });
             });
             names.resolve(&mut v, |c| &mut c.person);
-            let cap = v.len() / P + 8;
-            let mut b: Vec<Vec<Ck>> = (0..P).map(|_| Vec::with_capacity(cap)).collect();
-            for c in v {
-                b[part(c.person)].push(c);
-            }
-            b
+            partition(&v, |c| part(c.person))
         })
         .collect();
     rayon::spawn(move || drop(click_bufs));
@@ -681,21 +872,11 @@ pub fn run(n: usize) {
         cat_rev: vec![0; ncat],
         cat_touched: Vec::new(),
     };
-    fn transpose<T>(src: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
-        let mut by_q: Vec<Vec<Vec<T>>> = (0..P).map(|_| Vec::with_capacity(src.len())).collect();
-        for row in src {
-            for (q, v) in row.into_iter().enumerate() {
-                by_q[q].push(v);
-            }
-        }
-        by_q
-    }
-    let ev_by_q = transpose(ev_by_person);
-    let ck_by_q = transpose(ck_buckets);
-    let work = ev_by_q
+    let work = (0..P)
         .into_par_iter()
-        .zip(ck_by_q.into_par_iter())
-        .fold(new_work, |mut w, (ev_parts, ck_parts)| {
+        .fold(new_work, |mut w, q| {
+            let ev_parts: Vec<&[Ev2]> = ev_by_person.iter().map(|x| x.slice(q)).collect();
+            let ck_parts: Vec<&[Ck]> = ck_buckets.iter().map(|x| x.slice(q)).collect();
             // Local person ids in first-seen order; the hash seed differs from
             // `part`, whose top bits are the same for everyone in this partition.
             const LOCAL_SEED: u64 = 0x3C6E_F372_FE94_F82B;
@@ -705,7 +886,7 @@ pub fn run(n: usize) {
             let mut counts: Vec<u32> = Vec::new();
             let mut lids: Vec<u32> = Vec::with_capacity(total);
             for v in &ev_parts {
-                for e in v {
+                for e in v.iter() {
                     let h = mix(e.person ^ LOCAL_SEED);
                     let lid = match table.find(h, |x| x.0 == e.person) {
                         Some(x) => x.1,
@@ -733,7 +914,7 @@ pub fn run(n: usize) {
                 let dst = ev.spare_capacity_mut();
                 let mut n = 0;
                 for v in &ev_parts {
-                    for e in v {
+                    for e in v.iter() {
                         let l = lids[n] as usize;
                         dst[pos[l] as usize].write(*e);
                         pos[l] += 1;
@@ -750,7 +931,7 @@ pub fn run(n: usize) {
             let mut cl: Vec<(u32, Ck)> = Vec::new();
             let mut ccounts = vec![0u32; np + 1];
             for v in &ck_parts {
-                for c in v {
+                for c in v.iter() {
                     let h = mix(c.person ^ LOCAL_SEED);
                     if let Some(x) = table.find(h, |x| x.0 == c.person) {
                         ccounts[x.1 as usize] += 1;
@@ -802,6 +983,10 @@ pub fn run(n: usize) {
             a.agg = a.agg.add(b.agg);
             a
         });
+    rayon::spawn(move || {
+        drop(ev_by_person);
+        drop(ck_buckets);
+    });
     mark(t0, &mut last, "sessions");
 
     // ------------------------------------------------------------ output
