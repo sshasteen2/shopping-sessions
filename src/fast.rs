@@ -219,11 +219,36 @@ fn partition_n<T: Copy>(v: &[T], nparts: usize, key: impl Fn(&T) -> usize) -> Pa
     }
     let mut pos: Vec<u32> = off[..nparts].to_vec();
     let mut data: Vec<T> = Vec::with_capacity(v.len());
+    // Eight records per partition, then one sequential flush. A direct scatter
+    // writes one record to a random cache line; the flush writes 8 in a row.
+    const B: usize = 8;
+    let mut staged: Vec<T> = Vec::with_capacity(nparts * B);
+    // SAFETY: `T: Copy` has no destructor. Slots are overwritten before they are read.
+    unsafe { staged.set_len(nparts * B) };
+    let mut nloc = vec![0u8; nparts];
     {
         let dst = data.spare_capacity_mut();
         for (x, &k) in v.iter().zip(&ks) {
-            dst[pos[k as usize] as usize].write(*x);
-            pos[k as usize] += 1;
+            let k = k as usize;
+            let n = nloc[k] as usize;
+            staged[k * B + n] = *x;
+            if n + 1 == B {
+                let at = pos[k] as usize;
+                for j in 0..B {
+                    dst[at + j].write(staged[k * B + j]);
+                }
+                pos[k] += B as u32;
+                nloc[k] = 0;
+            } else {
+                nloc[k] = (n + 1) as u8;
+            }
+        }
+        for k in 0..nparts {
+            let n = nloc[k] as usize;
+            let at = pos[k] as usize;
+            for j in 0..n {
+                dst[at + j].write(staged[k * B + j]);
+            }
         }
     }
     // SAFETY: every one of the v.len() slots was written exactly once.
