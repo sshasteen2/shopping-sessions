@@ -100,3 +100,38 @@ Scorer result: `aa39117` (current `main`) = **1.6126s** (was 1.7430s for `42e754
 | Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs 42e7549 | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
 | `main` | `aa39117` | hashed long event_id + byte-confirmed dedup | scorer 1.6126s | — | scorer -7.5% | as logged above |
+
+### 2026-11-22 03:35 UTC - Cursor agent
+
+Rebased attention onto `aa39117` after the log above. Do not merge `cursor/robust-fallback-0105` (`11c6b93e276acfda536c7a14586409492bf78139`) into current `main`. That commit beats `42e7549` and then loses once it is stacked on the event-hash path.
+
+`11c6b93` (on top of `42e7549` only): lowercase `e`/`k` + 32 hex are packed to a `u128` and inserted one shard-lock per chunk, not once per row. Repeated `u` + hex uses a thread-local cache of the shard key. Uppercase and other long ids stay on the byte arena. Two packed keys compare as prefix byte then `u128` (matches ASCII). Bit 62 stays clear. Event dedup is still exact `u64` equality, so this is not the hashed event-id design.
+
+Cursor VM, 8 vCPUs, `scripts/ab_linux.sh`, v5 seed 7 20M, 10 runs, both orders, vs `42e7549`:
+
+| Order | `42e7549` wall median | `11c6b93` wall median | `42e7549` CPU | `11c6b93` CPU |
+| --- | --- | --- | --- | --- |
+| baseline first | 1218 ms | 1120 ms | 8.3s | 7.6s |
+| candidate first | 1198 ms | 1060 ms | 8.1s | 7.4s |
+
+v5 60M, seed 42, 60M events / 15M clicks:
+
+| Order | `42e7549` wall median | `11c6b93` wall median | `42e7549` CPU | `11c6b93` CPU |
+| --- | --- | --- | --- | --- |
+| baseline first (6) | 3668 ms | 3401 ms | 26.7s | 24.4s |
+| candidate first (4) | 3749 ms | 3328 ms | 26.5s | 24.2s |
+
+Verification for `11c6b93`: `cargo test --release` 26 passed; fixtures 36/36; official v5 dev answer MATCH; v5 20M and v5 60M MATCH vs `42e7549`; old-format dev and old-format 20M MATCH vs `ENGINE=old`.
+
+Stacked on `aa39117` (their `fast.rs` kept, so long event ids are hashed, not batched):
+
+- Click batch plus user cache, 10 runs, `aa39117` first: median 966 ms / CPU 6.8s vs combined 1042 ms / CPU 7.2s. Slower.
+- User-cache only, 8 runs both orders: cache median 992 ms both times (CPU 6.7s / 6.8s). `aa39117` median 1047 ms / 7.0s when it ran first and 1000 ms / 6.9s when it ran second. Mins are 953–967 vs 964–969. Not a clear wall win. Not kept on top of `main`.
+
+Profile of `aa39117` on this VM, v5 20M (one run, wall 1142 ms: parse_events 526, dedup 119, clicks 130, sessions 171): event-parse closure 24% (SIMD scan and partition stores), `Ids::over_key` still 14% and still hottest on a failed shard `cmpxchg` (user and click ids), dedup fold 10%, session fold 9%, `parse_ts_cached` 6%, `memcmp` 5%. The lock that remains is real and is about the size of the noise on an A/B, which matches the user-cache result.
+
+Branches: `cursor/robust-fallback-0105` = `11c6b93e276acfda536c7a14586409492bf78139` (pushed, PR #3, do not merge). `main` = `aa39117fc8f39dbe27239df3aeeb7b8c8b90c88d`. `coordination` tip advances with this entry.
+
+| Branch | Commit | Change | v5 20M wall | v5 20M CPU | vs 42e7549 | Verification |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cursor/robust-fallback-0105` | `11c6b93` | batched `e`/`k` hex intern + user cache, no event-hash | Cursor VM median 1060–1120 ms vs 1198–1218 | 7.4–7.6s vs 8.1–8.3s | about -8% to -12% wall | 36/36, v5 dev answer, v5 20M+60M vs `42e7549`, old dev+20M. Loses when stacked on `aa39117`. |
