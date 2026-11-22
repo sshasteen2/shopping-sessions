@@ -770,6 +770,8 @@ pub fn run(n: usize) {
         .map(|c| {
             let mut b: Vec<Ev> = Vec::with_capacity(c.data.len() / 70 + 16);
             let mut dc = DateCache::default();
+            let mut long_at: Vec<u32> = Vec::new();
+            let mut long_vals: Vec<u128> = Vec::new();
             rows::for_each_row::<7>(c.data, c.header, |f| {
                 if f[0].is_empty() {
                     return;
@@ -778,7 +780,30 @@ pub fn run(n: usize) {
                     return;
                 };
                 let user = ids.key(f[1]);
-                let eid = ids.key(f[0]);
+                let eid = if f[0].len() == 33 && f[0][0] == b'e' {
+                    let mut value = 0u128;
+                    let mut hex = true;
+                    for &byte in &f[0][1..] {
+                        let n = match byte {
+                            b'0'..=b'9' => byte - b'0',
+                            b'a'..=b'f' => byte - b'a' + 10,
+                            _ => {
+                                hex = false;
+                                break;
+                            }
+                        };
+                        value = (value << 4) | n as u128;
+                    }
+                    if hex {
+                        long_at.push(b.len() as u32);
+                        long_vals.push(value);
+                        0
+                    } else {
+                        ids.key(f[0])
+                    }
+                } else {
+                    ids.key(f[0])
+                };
                 let kind: u32 = match f[4] {
                     b"view" => 0,
                     b"cart" => 1,
@@ -816,6 +841,12 @@ pub fn run(n: usize) {
                     pk: price | (kind << 24) | ((ok as u32) << 31),
                 });
             });
+            if !long_vals.is_empty() {
+                let keys = ids.intern_lower_hex_batch(b'e', &long_vals);
+                for (at, key) in long_at.iter().zip(keys) {
+                    b[*at as usize].eid = key;
+                }
+            }
             names.resolve_valid(&mut b);
             partition_n(&b, P * SUB, |e| (mix(e.eid) >> (64 - PBITS - SUB_BITS)) as usize)
         })
@@ -874,6 +905,8 @@ pub fn run(n: usize) {
         .map(|c| {
             let mut v: Vec<Ck> = Vec::with_capacity(c.data.len() / 45 + 8);
             let mut dc = DateCache::default();
+            let mut long_at: Vec<u32> = Vec::new();
+            let mut long_vals: Vec<u128> = Vec::new();
             rows::for_each_row::<4>(c.data, c.header, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -889,13 +922,43 @@ pub fn run(n: usize) {
                 if ts < click_lo || ts >= win_end {
                     return;
                 }
+                let cid = if f[0].len() == 33 && f[0][0] == b'k' {
+                    let mut value = 0u128;
+                    let mut hex = true;
+                    for &b in &f[0][1..] {
+                        let n = match b {
+                            b'0'..=b'9' => b - b'0',
+                            b'a'..=b'f' => b - b'a' + 10,
+                            _ => {
+                                hex = false;
+                                break;
+                            }
+                        };
+                        value = (value << 4) | n as u128;
+                    }
+                    if hex {
+                        long_at.push(v.len() as u32);
+                        long_vals.push(value);
+                        0
+                    } else {
+                        ids.key(f[0])
+                    }
+                } else {
+                    ids.key(f[0])
+                };
                 v.push(Ck {
                     person: user,
-                    cid: ids.key(f[0]),
+                    cid,
                     ts: (ts - click_lo) as u32,
                     camp,
                 });
             });
+            if !long_vals.is_empty() {
+                let keys = ids.intern_lower_hex_batch(b'k', &long_vals);
+                for (at, key) in long_at.iter().zip(keys) {
+                    v[*at as usize].cid = key;
+                }
+            }
             names.resolve(&mut v, |c| &mut c.person);
             partition(&v, |c| part(c.person))
         })
