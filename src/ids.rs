@@ -57,6 +57,69 @@ const fn build_decode() -> [u8; 64] {
 
 static CODE: [u8; 256] = build_code();
 static DECODE: [u8; 64] = build_decode();
+const HEX_TAG: u32 = 1 << 31;
+
+/// 32 lowercase hex digits, first digit in the high nibble. `None` otherwise.
+fn pack_lower_hex32(s: &[u8]) -> Option<u128> {
+    if s.len() != 32 {
+        return None;
+    }
+    unsafe { pack_lower_hex32_simd(s) }
+}
+
+#[target_feature(enable = "ssse3")]
+unsafe fn pack_lower_hex32_simd(s: &[u8]) -> Option<u128> {
+    use std::arch::x86_64::*;
+    let a = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+    let b = _mm_loadu_si128(s.as_ptr().add(16) as *const __m128i);
+    let na = nibbles_sse(a)?;
+    let nb = nibbles_sse(b)?;
+    Some(((pack8(na).swap_bytes() as u128) << 64) | pack8(nb).swap_bytes() as u128)
+}
+
+#[target_feature(enable = "ssse3")]
+unsafe fn nibbles_sse(v: std::arch::x86_64::__m128i) -> Option<std::arch::x86_64::__m128i> {
+    use std::arch::x86_64::*;
+    let digit = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let is_digit = _mm_cmpeq_epi8(_mm_min_epu8(digit, _mm_set1_epi8(9)), digit);
+    let alpha = _mm_sub_epi8(v, _mm_set1_epi8((b'a' as i8).wrapping_sub(10)));
+    let ge10 = _mm_cmpeq_epi8(_mm_max_epu8(alpha, _mm_set1_epi8(10)), alpha);
+    let le15 = _mm_cmpeq_epi8(_mm_min_epu8(alpha, _mm_set1_epi8(15)), alpha);
+    let is_alpha = _mm_and_si128(ge10, le15);
+    if _mm_movemask_epi8(_mm_or_si128(is_digit, is_alpha)) != 0xFFFF {
+        return None;
+    }
+    Some(_mm_or_si128(_mm_and_si128(is_digit, digit), _mm_and_si128(is_alpha, alpha)))
+}
+
+#[target_feature(enable = "ssse3")]
+unsafe fn pack8(nib: std::arch::x86_64::__m128i) -> u64 {
+    use std::arch::x86_64::*;
+    let shift = _mm_slli_epi16(nib, 4);
+    let merged = _mm_or_si128(shift, _mm_srli_epi16(nib, 8));
+    let packed = _mm_shuffle_epi8(
+        merged,
+        _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0),
+    );
+    _mm_cvtsi128_si64(packed) as u64
+}
+
+fn mix_hex(value: u128) -> u64 {
+    let mut x = value as u64 ^ ((value >> 64) as u64).rotate_left(17);
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 30;
+    x.wrapping_mul(0x94D0_49BB_1331_11EB) ^ (x >> 31)
+}
+
+fn push_hex32(out: &mut Vec<u8>, mut v: u128) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 32];
+    for i in (0..32).rev() {
+        buf[i] = HEX[(v & 0xf) as usize];
+        v >>= 4;
+    }
+    out.extend_from_slice(&buf);
+}
 
 /// One shard of interned long IDs: bytes live in one arena.
 #[derive(Default)]
@@ -66,6 +129,7 @@ struct Shard {
     data: Vec<u8>,
     /// starts[i]..starts[i + 1] is ID i's bytes
     starts: Vec<u32>,
+    packed: Vec<u128>,
 }
 
 impl Shard {
@@ -142,14 +206,43 @@ impl Ids {
 
     #[inline(never)]
     fn over_key(&self, s: &[u8]) -> u64 {
+        if s.len() == 33 && s[0] == b'u' {
+            if let Some(value) = pack_lower_hex32(&s[1..]) {
+                return self.publish_hex(value);
+            }
+        }
+        self.publish_bytes(s)
+    }
+
+    fn publish_hex(&self, value: u128) -> u64 {
+        let h = mix_hex(value);
+        let si = ((h >> 32) as usize) & (SHARDS - 1);
+        let mut sh = self.shards[si].lock().unwrap();
+        let Shard { table, packed, .. } = &mut *sh;
+        if let Some(&(_, i)) = table.find(h, |&(eh, i)| {
+            eh == h && i & HEX_TAG != 0 && packed[(i & !HEX_TAG) as usize] == value
+        }) {
+            return OVER | ((si as u64) << 32) | i as u64;
+        }
+        let n = packed.len() as u32;
+        assert!(n & HEX_TAG == 0, "hex shard overflow");
+        packed.push(value);
+        let tagged = n | HEX_TAG;
+        table.insert_unique(h, (h, tagged), |&(eh, _)| eh);
+        OVER | ((si as u64) << 32) | tagged as u64
+    }
+
+    fn publish_bytes(&self, s: &[u8]) -> u64 {
         let h = self.hasher.hash_one(s);
         // Middle bits pick the shard: hashbrown uses the low bits for buckets
         // and the top 7 for its control tags, so neither is constant per shard.
         let si = ((h >> 32) as usize) & (SHARDS - 1);
         let mut sh = self.shards[si].lock().unwrap();
-        let Shard { table, data, starts } = &mut *sh;
+        let Shard { table, data, starts, .. } = &mut *sh;
         if let Some(&(_, i)) = table.find(h, |&(eh, i)| {
-            eh == h && &data[starts[i as usize] as usize..starts[i as usize + 1] as usize] == s
+            eh == h
+                && i & HEX_TAG == 0
+                && &data[starts[i as usize] as usize..starts[i as usize + 1] as usize] == s
         }) {
             return OVER | ((si as u64) << 32) | i as u64;
         }
@@ -161,7 +254,25 @@ impl Ids {
         OVER | ((si as u64) << 32) | i as u64
     }
 
+    fn hex_value(&self, k: u64) -> Option<u128> {
+        if k & OVER == 0 {
+            return None;
+        }
+        let local = (k & LOCAL_MASK) as u32;
+        if local & HEX_TAG == 0 {
+            return None;
+        }
+        let si = ((k & !OVER) >> 32) as usize;
+        let sh = self.shards[si].lock().unwrap();
+        Some(sh.packed[(local & !HEX_TAG) as usize])
+    }
+
     pub fn write_bytes(&self, k: u64, out: &mut Vec<u8>) {
+        if let Some(value) = self.hex_value(k) {
+            out.push(b'u');
+            push_hex32(out, value);
+            return;
+        }
         if k & OVER != 0 {
             let si = ((k & !OVER) >> 32) as usize;
             let sh = self.shards[si].lock().unwrap();
@@ -187,9 +298,11 @@ impl Ids {
     #[inline]
     pub fn cmp(&self, a: u64, b: u64) -> Ordering {
         if (a | b) & OVER == 0 {
-            a.cmp(&b)
-        } else {
-            self.to_vec(a).cmp(&self.to_vec(b))
+            return a.cmp(&b);
+        }
+        match (self.hex_value(a), self.hex_value(b)) {
+            (Some(va), Some(vb)) => va.cmp(&vb),
+            _ => self.to_vec(a).cmp(&self.to_vec(b)),
         }
     }
 }
@@ -197,6 +310,20 @@ impl Ids {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_hex_nibble_order_and_reject() {
+        let hi = pack_lower_hex32(b"f0000000000000000000000000000000").unwrap();
+        let lo = pack_lower_hex32(b"0fffffffffffffffffffffffffffffff").unwrap();
+        assert!(hi > lo);
+        assert_eq!(hi >> 124, 0xf);
+        assert!(pack_lower_hex32(b"F0000000000000000000000000000000").is_none());
+        assert!(pack_lower_hex32(b"g0000000000000000000000000000000").is_none());
+        assert!(pack_lower_hex32(b"0123").is_none());
+        let ids = Ids::default();
+        let key = ids.key(b"uf0000000000000000000000000000000");
+        assert_eq!(ids.to_vec(key), b"uf0000000000000000000000000000000");
+    }
 
     #[test]
     fn order_and_roundtrip() {
