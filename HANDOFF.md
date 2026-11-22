@@ -36,7 +36,9 @@ Local A/B on this machine (8 vCPU, 20M events, seed 7), alternating runs, releas
 | Multiply hash inside hashbrown dedup | 811 vs 824 ms | 5.8 vs 5.7 s | no |
 | Unrolled ID packing (microbench, 9-byte ids) | — | ~4 ns either way | no |
 
-Each row is its own alternating A/B. Absolute times drifted between sessions, so compare only within a row.
+Each row is its own alternating A/B. Absolute times drifted between sessions (this VM moved between about 0.78s and 0.95s with no code change), so compare only within a row.
+
+Stacked tip `6d84a39` versus `9a9f120` (`bin-base`), quiet 10-run alternating A/B on the same 20M set, 8 vCPUs: wall median **782 ms vs 786 ms** (no wall gain), CPU **5.30 s vs 5.13 s**, sys **0.52 s vs 0.42 s**. The per-change wall gaps above showed up while the machine was slower and noisier; they do not reproduce as a wall win once both binaries are in the 0.75–0.85s band. CPU and kernel time are slightly lower. One 60M run (seed 42) was 2.49s vs 2.46s wall, user CPU 15.71s vs 15.01s.
 
 The scorer's times vary by up to ±20% between machines, so differences under about 10% cannot be read from single submissions. `9a9f120` at 1.4273s versus `0484ec1` at 1.4103s is that kind of tie.
 
@@ -152,13 +154,27 @@ All of these were measured on Linux or with warm-cache benchmarks:
 - **A single-entry date cache:** rows are shuffled across days, so it mostly missed. It was replaced with the 64-slot cache.
 - **Larger Parquet batch and page sizes:** within noise.
 
-## Ideas not yet tried, best first
+## Ideas from the previous list, now measured
 
-1. **Sessions ordering without per-person sorts.** Radix-sort each person partition by `ts` (31 bits, 3 passes of 11 bits on 16-byte records in L2), then do the existing stable counting sort by local person ID. Each person's events then come out in `ts` order. Expected ~0.5 CPU-s saved.
-2. **Parse `HH:MM:SS` 8 bytes at a time** (SWAR digit and colon validation plus multiply tricks) in `parse_ts_cached`, and do the same for F3 digit runs.
-3. **28-byte `Ev`:** `ingest_ts` is always F1 (whole seconds), so it fits as i32 seconds, with an exact fallback flag. Use `#[repr(packed(4))]`. Less memory traffic in parse and dedup.
-4. **Less fresh memory** to reduce kernel time (~15% of CPU): reuse per-thread buffers across chunks and partitions, and avoid copying in the sessions gather.
-5. **Pack the event and user IDs with SIMD** (pshufb table lookup) instead of the byte loop in `ids.rs`.
-6. **Overlap clicks parsing with dedup:** they are independent until sessions.
+Tried on this 8-vCPU Xeon (x86-64-v3, rustc 1.100). Output was checked against `ENGINE=old` before any timing that was a candidate to keep. Reverted when wall time did not clearly drop.
 
-Keep the fallbacks and exactness rules intact, and re-run all of [How to verify](#how-to-verify) after every idea.
+- **Radix-sort sessions by `ts`, then stable group.** Correct (dev MATCH). Wall median 982 vs 983 ms, CPU 6.4 vs 6.5 s. The per-person sorts are already in cache; the extra streaming passes cost as much as they save. Reverted.
+- **SWAR `HH:MM:SS` and 8-digit F3.** Matched `parse_ts` in unit tests and dev MATCH. Wall median 878 vs 864 ms, CPU 5.9 vs 5.9 s. Reverted.
+- **28-byte packed `Ev`** (24-bit biased ingest seconds, category in the top 8, fallback to the old engine if an ingest is not whole seconds or outside ±97 days). Dev MATCH, and the fast path did not fall back on generator data. Two A/Bs: wall median 962→921 then 927→915 ms, CPU 6.37→6.23 then 6.11→5.91 s. Dedup did not speed up (misaligned 28-byte slots). Wall gain was not repeatable. Reverted.
+- **Thread-local reuse** of the parse buffer and the partition scratch. Dev MATCH. Wall median 781 vs 789 ms (no gain), CPU 5.28→5.12 s, sys 0.52→0.45 s. Reverted.
+- **Unrolled ID packing.** Microbench on 200k 9-byte ids: about 4 ns either way (loop 4.2 ns, unroll 3.5–4.9 ns). Not integrated. A pshufb lookup cannot cover the 256-entry code table.
+- **Overlap click parsing with dedup** via `rayon::join`. Dev MATCH. Both sides are CPU-saturated, so wall median stayed 903 vs 900 ms. CPU 5.97 vs 5.7 s. Reverted.
+- **64-slot direct-mapped cache in front of `NameTable::get`.** Dev MATCH. Wall median 834 vs 837 ms, CPU 5.66 vs 5.43 s. Reverted.
+- **Open-addressing dedup table** and a **one-multiply hash** inside hashbrown. Both MATCH on dev. Neither beat hashbrown on wall (799 vs 787 ms, and 811 vs 824 ms). Reverted.
+- **Scalar per-line CSV scan** versus the SIMD `for_each_row`: 97 ns/row vs 48 ns/row on a 300 MB event file, and the scalar scan disagreed. Not integrated.
+
+## What is still worth trying
+
+- A fused event parser that pulls field parsing into the SIMD delimiter loop, so LLVM stops outlining the per-row closure. The closure plus `parse_ts_cached` is still the largest self-time. Previous tokenizer rewrites were slower; this one has not been written.
+- Tuning the write-combine depth (4 or 16) now that the 8-deep flush is in the tip. Only worth it if a quiet A/B shows a wall gap, which the stacked tip currently does not.
+
+## Verification of the tip (`6d84a39`)
+
+8 vCPUs. `ENGINE=old` references: dev seed 1, 20M seed 7, dev-size seeds 2, 3, and 11. 60M seed 42 compared to the `9a9f120` binary (the old engine was not rerun at 60M). All of these printed MATCH. `cargo test --release`: 23 passed. Fixtures: 36/36. 60M fit: about 16 GB available plus a 30 GB balloon, and both runs finished (2.49s and 2.46s).
+
+Recommendation: practice score stays a tie around 1.42s. Submit `9a9f120` if you want the build that already scored. The tip is byte-identical on every set above and uses a little less CPU, but a quiet 10-run A/B does not show a lower wall time.
