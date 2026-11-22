@@ -29,6 +29,7 @@ Local A/B on this machine (8 vCPU, 20M events, seed 7), alternating runs, releas
 |---|---|---|---|
 | LLVM `-C llvm-args=-inline-threshold=1000` | 902 → 872 ms and 876 → 857 ms | 6.1 → 5.9 s and 6.1 → 5.8 s | yes |
 | Write-combining partition scatter (8 records, then a sequential flush) | 897 → 880 ms and 908 → 864 ms | 6.5 → 5.9 s and 5.97 → 5.75 s | yes |
+| `MADV_HUGEPAGE` on large partition buffers | 932 → 884 ms and 906 → 866 ms | 6.28 → 5.90 s and 5.97 → 5.78 s | yes |
 | Radix-sort events by `ts`, then stable group | 982 vs 983 ms | 6.4 vs 6.5 s | no |
 | SWAR `HH:MM:SS` and 8-digit F3 parse | 878 vs 864 ms | 5.9 vs 5.9 s | no |
 | Open-addressing dedup table (replaced hashbrown) | 799 vs 787 ms | 5.5 vs 5.4 s | no |
